@@ -30,6 +30,9 @@ class Context:
     pending_messages: list[str] = field(default_factory=list)
     reply_content: str | None = None
     system_prompt: str = ""
+    # Per-turn cache of resolved image references (ref -> URL), so a turn
+    # resolves each stored image at most once across steps.
+    resolved_images: dict = field(default_factory=dict)
 
     def add_messages(self, messages):
         self.messages.extend(deepcopy(messages))
@@ -63,6 +66,23 @@ class Context:
         # Summary is conversation data, never promoted to a system instruction.
         return {"role": "user", "content": "Summary of earlier conversation:\n" + content}
 
+    @staticmethod
+    def interleave(text, images):
+        """Rebuild ordered parts: an image's "at" offset places it inside the text;
+        images without "at" (plain images= input) follow all text."""
+        parts, cursor = [], 0
+        for image in images:
+            at = image.get("at", len(text))
+            if isinstance(at, bool) or not isinstance(at, int) or not cursor <= at <= len(text):
+                raise ValueError("Image offsets must be ordered positions within the text")
+            if text[cursor:at]:
+                parts.append({"type": "text", "text": text[cursor:at]})
+            parts.append({"type": "image_ref", **{k: v for k, v in image.items() if k != "at"}})
+            cursor = at
+        if text[cursor:]:
+            parts.append({"type": "text", "text": text[cursor:]})
+        return parts
+
     def model_messages(self):
         """Keep marks local and reject incomplete tool history before calling a model."""
         summary, records = self.active_history()
@@ -75,6 +95,11 @@ class Context:
                 continue
             role = message["role"]
             item = {"role": role, "content": message["content"]}
+            images = message.get("metadata", {}).get("images") if role == "user" else None
+            if images:
+                # Stored references only; BaseAgent.prepare_model_messages resolves
+                # them into image_url parts right before a model call.
+                item["content"] = self.interleave(message["content"], images)
             if role == "tool":
                 call_id = message["tool_call_id"]
                 if call_id not in pending:

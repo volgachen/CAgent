@@ -1,6 +1,6 @@
 # CAgent
 
-Python 3.10+ 的通用 Agent 框架，只依赖标准库。核心语义：**宿主自持存储（方法可同步可异步）、工具人工审批、协作式打断、轮末压缩、可审计的消息历史**。
+Python 3.10+ 的通用 Agent 框架，只依赖标准库。核心语义：**宿主自持存储（方法可同步可异步）、图像输入、工具人工审批、协作式打断、轮末压缩、可审计的消息历史**。
 
 ~~~text
 src/cagent/
@@ -69,6 +69,43 @@ print(ctx.reply)   # 你好！
 ~~~
 
 `arguments` 必须是字典（模型客户端返回 JSON 字符串时先解析）。空 content 且无工具调用表示静默结束，`ctx.reply` 为 None。`usage` 原样记录到 turn_end mark，不参与上下文统计。
+
+### 图像输入
+
+`run_turn(..., images=[...])` 给本轮用户输入附带图片。每项是引用字符串，或 `{"ref": ..., "detail": "auto" | "low" | "high"}`；有图时文本可以为空字符串。
+
+~~~python
+ctx = await Assistant.run_turn("这是什么？", session_id="demo", store=store, model=model,
+                               images=["file:42", {"ref": "https://example.com/a.png", "detail": "low"}])
+~~~
+
+`images=` 里的图片按列表顺序排在文本之后。需要图文交替时，输入改为由字符串和 `Image` 组成的有序列表（此时不再传 `images=`）：
+
+~~~python
+from cagent import Image
+
+ctx = await Assistant.run_turn(
+    ["旧版：", Image("file:a"), " 新版：", Image("file:b", detail="low"), " 哪个更好？"],
+    session_id="demo", store=store, model=model)
+~~~
+
+列表里只要出现字符串或 `Image`，就按交替输入处理；全是字典时仍是原来的消息批量输入。
+
+- 入库只存引用（`metadata.images`），不存图片字节；历史中的图片在后续轮次仍会发给模型。交替输入的文本片段拼接后存为 `content`，每张图额外记录 `at`（在 `content` 中的字符位置），只读文本的消费者不受影响。
+- 每次调用模型前，`resolve_image(store, ctx, image)` 把引用解析成模型可读的 URL，结果在本轮内缓存。默认只放行 `http(s)://` 和 `data:image/` 引用；宿主用文件 ID 时覆盖它，返回 data URL 或签名 URL：
+
+~~~python
+class Assistant(BaseAgent):
+    @classmethod
+    async def resolve_image(cls, store, ctx, image):
+        data = await my_blob_store.read(image["ref"])      # 宿主自己的文件存储
+        return "data:image/png;base64," + base64.b64encode(data).decode()
+~~~
+
+- 发给模型的是 OpenAI 风格的 content parts（`text` + `image_url`），`make_openai_model` 原样透传。
+- 压缩时图片随历史一起交给压缩模型，由摘要文本描述；压缩生效后，边界前的图片不再发送。
+- 目前只支持用户输入带图；工具结果仍为纯文本。默认 token 估算只计引用长度、不计图片本身；`COUNT_TOKENS` 收到的是未解析的 `image_ref` 部分，需要准确统计时在其中自行计入图片开销。
+
 
 ## 工具
 

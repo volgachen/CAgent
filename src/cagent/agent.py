@@ -5,12 +5,24 @@ import inspect
 import json
 import logging
 from copy import deepcopy
+from dataclasses import dataclass
 
 from .context import Context, append_messages
 from .storage import Store, maybe_await
 from .tools import execute_tool_call
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class Image:
+    """An image reference placed inside interleaved input, e.g. ["See:", Image("file:1")]."""
+
+    ref: str
+    detail: str | None = None
+
+    def as_dict(self):
+        return {"ref": self.ref} if self.detail is None else {"ref": self.ref, "detail": self.detail}
 
 
 class BaseAgent:
@@ -69,7 +81,8 @@ class BaseAgent:
         definitions = [dict(name=name, description=tool.description, parameters=tool.parameters)
                        for name, tool in tools.items()]
         ctx.step_index += 1
-        output = model(messages=ctx.model_messages(), tools=definitions)
+        messages = await cls.prepare_model_messages(store, ctx, ctx.model_messages())
+        output = model(messages=messages, tools=definitions)
         if inspect.isawaitable(output):
             output = await output
         if not isinstance(output, dict):
@@ -100,9 +113,14 @@ class BaseAgent:
     @classmethod
     async def run_turn(
         cls, input_message, *, session_id, store: Store, model, tools=None,
-        pipeline=None, on_event=None, system_prompt=None,
+        pipeline=None, on_event=None, system_prompt=None, images=None,
     ):
-        """Compression runs in this task before post_run_turn releases RUNNING."""
+        """Compression runs in this task before post_run_turn releases RUNNING.
+
+        images attaches image references to this turn's user input; see
+        normalize_images for the accepted forms and resolve_image for how a
+        reference becomes a URL the model can read.
+        """
         system_prompt = cls.resolve_system_prompt(system_prompt)
         max_steps = cls.MAX_STEPS
         compression_token_threshold = cls.COMPRESSION_TOKEN_THRESHOLD
@@ -130,7 +148,10 @@ class BaseAgent:
         if pipeline is not None and (not isinstance(pipeline, list)
                                      or any(not isinstance(item, str) or not item.strip() for item in pipeline)):
             raise ValueError("pipeline must be a list of non-empty instruction strings")
-        ctx = await cls.pre_run_turn(store, session_id, input_message, max_steps)
+        # Forward images only when given, so pre_run_turn overrides written
+        # against the text-only signature keep working for text input.
+        extra = {} if images is None else {"images": images}
+        ctx = await cls.pre_run_turn(store, session_id, input_message, max_steps, **extra)
         ctx.system_prompt = system_prompt
         ctx.tools = dict(tools) if tools is not None else {}
         ctx.agent_name = agent_name
@@ -198,23 +219,32 @@ class BaseAgent:
                 logger.exception("Trace callback failed; continuing the agent turn")
 
     @classmethod
-    async def pre_run_turn(cls, store, session_id, input_message, max_steps):
+    async def pre_run_turn(cls, store, session_id, input_message, max_steps, images=None):
         session = await maybe_await(store.get_session(session_id))
         if session["deleted_at"] is not None:
             raise ValueError("Session is deleted")
-        if isinstance(input_message, list):
+        images = cls.normalize_images(images)
+        if isinstance(input_message, list) and any(isinstance(part, (str, Image)) for part in input_message):
+            if images:
+                raise ValueError("Interleaved input carries its images inline; do not also pass images=")
+            content, images = cls.normalize_interleaved(input_message)
+        elif isinstance(input_message, list):
             if not input_message or any(not isinstance(message, dict) for message in input_message):
                 raise ValueError("Input batch must be a non-empty list of message objects")
             content = json.dumps({"messages": input_message}, ensure_ascii=False, allow_nan=False)
-        elif isinstance(input_message, str) and input_message.strip():
+        elif isinstance(input_message, str) and (input_message.strip() or images):
             content = input_message
         else:
-            raise ValueError("Input must be non-empty text or a message batch")
+            raise ValueError("Input must be non-empty text, a message batch, or text with images")
         ctx = Context(session_id=session_id, max_steps=max_steps)
         # Deleted rows retain compression boundaries; projection hides their content.
         ctx.add_messages(await maybe_await(store.list_messages(session_id, include_deleted=True)))
         ctx.model_messages()
-        await append_messages(store, ctx, [{"role": "user", "type": "signal", "content": content}])
+        signal = {"role": "user", "type": "signal", "content": content}
+        if images:
+            # Only references are persisted; image bytes stay in host storage.
+            signal["metadata"] = {"images": images}
+        await append_messages(store, ctx, [signal])
         ctx.pending_messages = cls.PIPELINE.copy()
         await maybe_await(store.set_status(session_id, "RUNNING"))
         return ctx
@@ -263,6 +293,91 @@ class BaseAgent:
         """
         if await maybe_await(store.get_status(ctx.session_id)) != "INTERRUPTED":
             await maybe_await(store.set_status(ctx.session_id, "RUNNING"))
+
+    @staticmethod
+    def normalize_images(images):
+        """Validate turn images into stored references: [{"ref": str, "detail"?: str}].
+
+        Each item is a non-empty reference string (host file ID, https URL or
+        data URL), an Image, or a {"ref", "detail"} dictionary, where detail is
+        auto, low or high and is forwarded to the model unchanged.
+        """
+        if images is None:
+            return []
+        if not isinstance(images, list):
+            raise ValueError("images must be a list of references")
+        result = []
+        for image in images:
+            item = ({"ref": image} if isinstance(image, str)
+                    else image.as_dict() if isinstance(image, Image) else image)
+            if not isinstance(item, dict) or not set(item) <= {"ref", "detail"}:
+                raise ValueError("An image must be a reference string or a {ref, detail} object")
+            if not isinstance(item.get("ref"), str) or not item["ref"].strip():
+                raise ValueError("Image ref must be a non-empty string")
+            if "detail" in item and item["detail"] not in ("auto", "low", "high"):
+                raise ValueError("Image detail must be auto, low or high")
+            result.append(dict(item))
+        return result
+
+    @classmethod
+    def normalize_interleaved(cls, parts):
+        """Split ["text", Image(...), ...] into stored text plus images placed by offset.
+
+        Text segments are concatenated into content; each image records "at",
+        the character offset in content where it appears, so the model sees
+        text and images in the original order.
+        """
+        content, images = "", []
+        for part in parts:
+            if isinstance(part, str):
+                content += part
+            elif isinstance(part, Image):
+                image = cls.normalize_images([part])[0]
+                image["at"] = len(content)
+                images.append(image)
+            else:
+                raise ValueError("Interleaved input may only contain text strings and Image objects")
+        if not images and not content.strip():
+            raise ValueError("Interleaved input needs non-empty text or at least one image")
+        return content, images
+
+    @classmethod
+    async def resolve_image(cls, store, ctx, image):
+        """Turn a stored image reference into a URL the model can read.
+
+        The default passes through http(s) and data:image URLs. Hosts that
+        store file IDs override this to return a data URL or a signed URL;
+        it is called at most once per reference per turn or compression.
+        """
+        ref = image["ref"]
+        if ref.startswith(("https://", "http://", "data:image/")):
+            return ref
+        raise ValueError(f"Cannot resolve image reference {ref!r}; override resolve_image")
+
+    @classmethod
+    async def prepare_model_messages(cls, store, ctx, messages):
+        """Replace image_ref parts with OpenAI-style image_url parts before a model call."""
+        for message in messages:
+            if not isinstance(message["content"], list):
+                continue
+            parts = []
+            for part in message["content"]:
+                if part.get("type") != "image_ref":
+                    parts.append(part)
+                    continue
+                ref = part["ref"]
+                if ref not in ctx.resolved_images:
+                    url = await cls.resolve_image(
+                        store, ctx, {k: v for k, v in part.items() if k in ("ref", "detail")})
+                    if not isinstance(url, str) or not url.strip():
+                        raise ValueError("resolve_image must return a non-empty URL string")
+                    ctx.resolved_images[ref] = url
+                image_url = {"url": ctx.resolved_images[ref]}
+                if "detail" in part:
+                    image_url["detail"] = part["detail"]
+                parts.append({"type": "image_url", "image_url": image_url})
+            message["content"] = parts
+        return messages
 
     @classmethod
     async def pre_run_step(cls, store, ctx):
@@ -353,6 +468,8 @@ class BaseAgent:
                 "metadata": {"through_message_id": through},
             }]))[0]
             before = await cls.count_context_tokens(ctx.model_messages(), cls.tool_definitions(ctx), count_tokens)
+            # Images are sent with the history so the summary can describe them.
+            messages = await cls.prepare_model_messages(store, ctx, messages)
             output = model(
                 messages=[{"role": "system", "content": cls.COMPRESSION_INSTRUCTION}] + messages,
                 tools=[])

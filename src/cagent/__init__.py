@@ -1,4 +1,4 @@
-from .agent import BaseAgent
+from .agent import BaseAgent, Image
 from .context import Context, append_messages
 from .models import ModelError, make_openai_model
 from .storage import Store, maybe_await
