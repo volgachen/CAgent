@@ -62,5 +62,9 @@ async def execute_tool_call(tool_call, tools, store: Store, ctx, *, agent_cls):
     if isinstance(value, ToolResult):
         metadata = deepcopy(value.metadata)
         json.dumps(metadata, ensure_ascii=False, allow_nan=False)
+        if value.images:
+            # References only (validated by ToolResult); projected into the
+            # tool message's content by Context.model_messages.
+            metadata["images"] = deepcopy(value.images)
         return dict(message(value.content, tool.result_type), metadata=metadata)
     return message(value, tool.result_type)

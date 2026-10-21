@@ -1,10 +1,11 @@
 # CAgent
 
-Python 3.10+ 的通用 Agent 框架，只依赖标准库。核心语义：**宿主自持存储（方法可同步可异步）、图像输入、工具人工审批、协作式打断、轮末压缩、可审计的消息历史**。
+Python 3.10+ 的通用 Agent 框架，只依赖标准库。核心语义：**宿主自持存储（方法可同步可异步）、图像输入（用户输入与工具结果）、工具人工审批、协作式打断、轮末压缩、可审计的消息历史**。
 
 ~~~text
 src/cagent/
 ├── agent.py     # BaseAgent：模型 → 工具 → 模型循环、Hook 链、压缩调度
+├── images.py    # 图片引用（Image）与校验，用户输入和工具结果共用
 ├── context.py   # 每轮新建的 Context；append_messages 先落库再加入内存
 ├── storage.py   # Store 协议（由宿主实现；方法可同步或异步）
 ├── stores.py    # MemoryStore / SQLiteStore 参考实现
@@ -104,7 +105,7 @@ class Assistant(BaseAgent):
 
 - 发给模型的是 OpenAI 风格的 content parts（`text` + `image_url`），`make_openai_model` 原样透传。
 - 压缩时图片随历史一起交给压缩模型，由摘要文本描述；压缩生效后，边界前的图片不再发送。
-- 目前只支持用户输入带图；工具结果仍为纯文本。默认 token 估算只计引用长度、不计图片本身；`COUNT_TOKENS` 收到的是未解析的 `image_ref` 部分，需要准确统计时在其中自行计入图片开销。
+- 工具结果也可以带图，见下文“工具返回图片”。默认 token 估算只计引用长度、不计图片本身；`COUNT_TOKENS` 收到的是未解析的 `image_ref` 部分，需要准确统计时在其中自行计入图片开销。
 
 
 ## 工具
@@ -114,6 +115,14 @@ class Assistant(BaseAgent):
 - 未知工具、参数不匹配和 `ToolError` 以纯文本错误结果交给下一步模型；意外异常向外抛出（可能有副作用，不自动重试）。
 - 字符串返回值原样写入 tool 消息；其他返回值须可 JSON 序列化。
 - 需要给消息附加宿主数据时返回 `ToolResult(content="正文", metadata={"ids": [1]})`，metadata 只入库不发给模型。
+
+### 工具返回图片
+
+工具返回 `ToolResult(content="已截图", images=["file:42", {"ref": "https://...", "detail": "low"}])` 即可把图片交给模型。`images` 的写法与用户输入图片相同（引用字符串、`Image` 或 `{ref, detail}`），在构造时校验；入库时存为 tool 消息的 `metadata.images`（只存引用，`"images"` 因此是保留键，不能再放进 `metadata`）。
+
+- 发给模型时，tool 消息的 content 变为 `[文本, image_url, ...]`，引用同样经 `resolve_image` 解析、本轮内缓存。出错、被拒绝或被跳过的工具结果不带图。
+- `TOOL_IMAGE_LIMIT = N` 只把最近 N 张工具图片发给模型（`None` 全部保留，`0` 全部不发），更早的替换为“[k earlier tool image(s) omitted]”文字；用户图片不受影响，入库的引用也不删除。压缩时同样遵守该限制。浏览器截图这类每步都产生图片的工具建议设一个小值。
+- 线上格式：Chat Completions 已发布的 schema 只允许 tool 消息带文本，Responses API 的 `function_call_output` 则支持图片；很多网关在 Chat Completions 下也接受 tool 消息带图。`make_openai_model(tool_images="inline")`（默认）保持图片在 tool 消息内；严格按 schema 校验的端点用 `tool_images="user_message"`，图片会移到这批工具结果之后的一条 user 消息里，并注明是工具输出而非用户指令。自己写模型适配器的宿主可直接调用 `relocate_tool_images(messages)` 得到同样效果。
 - 工具用 `Tool.result_type` 声明成功结果的消息分类（signal / memory / extra，默认 extra）；失败结果一律 extra。分类跟随工具定义，换注册名仍有效。
 - 工具调用 ID 在当前历史中必须唯一，复用会被拒绝。
 
@@ -191,7 +200,7 @@ ctx = await Assistant.compress_session(
 
 ## 模型适配器
 
-`make_openai_model(base_url=..., model_name=..., api_key=..., reasoning_effort=None)` 返回兼容任何 OpenAI 风格端点（vLLM、Ollama、OpenRouter、各类代理网关等）的异步模型，负责工具定义、调用与结果的线上格式转换；请求在后台线程执行。`reasoning_effort` 仅在提供时发送；`ModelError` 不回显响应体。人设通过 `system_prompt` 参数传入，适配器不额外添加。
+`make_openai_model(base_url=..., model_name=..., api_key=..., reasoning_effort=None, tool_images="inline")` 返回兼容任何 OpenAI 风格端点（vLLM、Ollama、OpenRouter、各类代理网关等）的异步模型，负责工具定义、调用与结果的线上格式转换；请求在后台线程执行。`reasoning_effort` 仅在提供时发送；`tool_images` 见“工具返回图片”；`ModelError` 不回显响应体。人设通过 `system_prompt` 参数传入，适配器不额外添加。
 
 ## Store 与消息
 

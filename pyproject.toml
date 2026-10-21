@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cagent"
-version = "0.3.0"
+version = "0.4.0"
 description = "Dependency-free, class-based agent loop with sync-or-async host storage, tool approval, cooperative interruption and turn-end compression"
 readme = "README.md"
 requires-python = ">=3.10"

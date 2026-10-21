@@ -33,6 +33,10 @@ class Context:
     # Per-turn cache of resolved image references (ref -> URL), so a turn
     # resolves each stored image at most once across steps.
     resolved_images: dict = field(default_factory=dict)
+    # Keep only the most recent N tool-result images in model input (None:
+    # keep all). Older ones are replaced by a text note; user images are
+    # never trimmed.
+    tool_image_limit: int | None = None
 
     def add_messages(self, messages):
         self.messages.extend(deepcopy(messages))
@@ -83,23 +87,52 @@ class Context:
             parts.append({"type": "text", "text": text[cursor:]})
         return parts
 
+    @staticmethod
+    def omitted_tool_images_note(count):
+        return f"\n[{count} earlier tool image(s) omitted]"
+
+    def _kept_tool_images(self, records):
+        """(message id, image index) pairs of the newest tool images within the limit."""
+        if self.tool_image_limit is None:
+            return None
+        kept, budget = set(), self.tool_image_limit
+        for message in reversed(records):
+            if budget <= 0:
+                break
+            if (message["role"] != "tool" or message.get("deleted_at") is not None):
+                continue
+            images = message.get("metadata", {}).get("images") or []
+            for index in range(len(images) - 1, -1, -1):
+                if budget <= 0:
+                    break
+                kept.add((message["id"], index))
+                budget -= 1
+        return kept
+
     def model_messages(self):
         """Keep marks local and reject incomplete tool history before calling a model."""
         summary, records = self.active_history()
         result = [{"role": "system", "content": self.system_prompt}] if self.system_prompt else []
         if summary is not None:
             result.append(self.summary_message(summary))
+        kept_tool_images = self._kept_tool_images(records)
         pending, seen = set(), set()
         for message in records:
             if message.get("deleted_at") is not None or message["role"] == "mark":
                 continue
             role = message["role"]
             item = {"role": role, "content": message["content"]}
-            images = message.get("metadata", {}).get("images") if role == "user" else None
+            images = message.get("metadata", {}).get("images") if role in ("user", "tool") else None
+            if images and role == "tool" and kept_tool_images is not None:
+                kept = [image for index, image in enumerate(images)
+                        if (message["id"], index) in kept_tool_images]
+                if len(kept) < len(images):
+                    item["content"] += self.omitted_tool_images_note(len(images) - len(kept))
+                images = kept
             if images:
                 # Stored references only; BaseAgent.prepare_model_messages resolves
                 # them into image_url parts right before a model call.
-                item["content"] = self.interleave(message["content"], images)
+                item["content"] = self.interleave(item["content"], images)
             if role == "tool":
                 call_id = message["tool_call_id"]
                 if call_id not in pending:

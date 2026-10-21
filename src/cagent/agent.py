@@ -5,24 +5,15 @@ import inspect
 import json
 import logging
 from copy import deepcopy
-from dataclasses import dataclass
 
 from .context import Context, append_messages
+from .images import Image, normalize_images as _normalize_images
 from .storage import Store, maybe_await
 from .tools import execute_tool_call
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True)
-class Image:
-    """An image reference placed inside interleaved input, e.g. ["See:", Image("file:1")]."""
-
-    ref: str
-    detail: str | None = None
-
-    def as_dict(self):
-        return {"ref": self.ref} if self.detail is None else {"ref": self.ref, "detail": self.detail}
+__all__ = ["BaseAgent", "Image"]
 
 
 class BaseAgent:
@@ -46,6 +37,9 @@ class BaseAgent:
     COMPRESSION_MODEL = None
     FORCE_COMPRESSION = False
     COUNT_TOKENS = None
+    # Send only the most recent N tool-result images to the model (None keeps
+    # all, 0 drops all); older ones become a text note. User images are kept.
+    TOOL_IMAGE_LIMIT = None
 
     PIPELINE: list[str] = []
 
@@ -128,6 +122,7 @@ class BaseAgent:
         compression_model = cls.COMPRESSION_MODEL
         count_tokens = cls.COUNT_TOKENS
         force_compression = cls.FORCE_COMPRESSION
+        tool_image_limit = cls.resolve_tool_image_limit()
         agent_name = cls.NAME
         for name, value in (("max_steps", max_steps),
                             ("compression_token_threshold", compression_token_threshold),
@@ -153,6 +148,7 @@ class BaseAgent:
         extra = {} if images is None else {"images": images}
         ctx = await cls.pre_run_turn(store, session_id, input_message, max_steps, **extra)
         ctx.system_prompt = system_prompt
+        ctx.tool_image_limit = tool_image_limit
         ctx.tools = dict(tools) if tools is not None else {}
         ctx.agent_name = agent_name
         if pipeline is not None:
@@ -302,22 +298,7 @@ class BaseAgent:
         data URL), an Image, or a {"ref", "detail"} dictionary, where detail is
         auto, low or high and is forwarded to the model unchanged.
         """
-        if images is None:
-            return []
-        if not isinstance(images, list):
-            raise ValueError("images must be a list of references")
-        result = []
-        for image in images:
-            item = ({"ref": image} if isinstance(image, str)
-                    else image.as_dict() if isinstance(image, Image) else image)
-            if not isinstance(item, dict) or not set(item) <= {"ref", "detail"}:
-                raise ValueError("An image must be a reference string or a {ref, detail} object")
-            if not isinstance(item.get("ref"), str) or not item["ref"].strip():
-                raise ValueError("Image ref must be a non-empty string")
-            if "detail" in item and item["detail"] not in ("auto", "low", "high"):
-                raise ValueError("Image detail must be auto, low or high")
-            result.append(dict(item))
-        return result
+        return _normalize_images(images)
 
     @classmethod
     def normalize_interleaved(cls, parts):
@@ -429,7 +410,8 @@ class BaseAgent:
         if session["deleted_at"] is not None or session["status"] != "IDLE":
             raise ValueError("External compression requires an idle, live session")
         ctx = Context(session_id, force_compression=True,
-                      token_count_is_estimate=count_tokens is None, system_prompt=system_prompt)
+                      token_count_is_estimate=count_tokens is None, system_prompt=system_prompt,
+                      tool_image_limit=cls.resolve_tool_image_limit())
         ctx.add_messages(await maybe_await(store.list_messages(session_id, include_deleted=True)))
         last_turn = next((m for m in reversed(ctx.messages)
                           if m["role"] == "mark" and m.get("name") == "turn_end"
@@ -462,7 +444,8 @@ class BaseAgent:
                            and m.get("deleted_at") is None
                            and m["metadata"]["stop_reason"] == "completed")
             boundary = next(i for i, m in enumerate(ctx.messages) if m["id"] == through)
-            messages = Context(ctx.session_id, messages=ctx.messages[:boundary + 1]).model_messages()
+            messages = Context(ctx.session_id, messages=ctx.messages[:boundary + 1],
+                               tool_image_limit=ctx.tool_image_limit).model_messages()
             started = (await append_messages(store, ctx, [{
                 "role": "mark", "name": "compression_started",
                 "metadata": {"through_message_id": through},
@@ -487,7 +470,8 @@ class BaseAgent:
                 "metadata": {"compression_id": started["id"], "through_message_id": through},
             }
             candidate = Context(ctx.session_id, messages=ctx.messages + [completion],
-                                system_prompt=ctx.system_prompt)
+                                system_prompt=ctx.system_prompt,
+                                tool_image_limit=ctx.tool_image_limit)
             after = await cls.count_context_tokens(
                 candidate.model_messages(), cls.tool_definitions(ctx), count_tokens)
             if after >= before:
@@ -505,6 +489,13 @@ class BaseAgent:
             # A summary failure must not discard a successful reply or the old history.
             ctx.compression_error = f"{type(exc).__name__}: {exc}"
             logger.warning("Compression failed for %s: %s", ctx.session_id, ctx.compression_error)
+
+    @classmethod
+    def resolve_tool_image_limit(cls):
+        limit = cls.TOOL_IMAGE_LIMIT
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("TOOL_IMAGE_LIMIT must be a non-negative integer or None")
+        return limit
 
     @classmethod
     def resolve_system_prompt(cls, system_prompt):
