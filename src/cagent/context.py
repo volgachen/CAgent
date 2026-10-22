@@ -37,6 +37,13 @@ class Context:
     # keep all). Older ones are replaced by a text note; user images are
     # never trimmed.
     tool_image_limit: int | None = None
+    # Turn-scoped compression: the threshold on tool calls made within one
+    # turn (None disables it) and the in-memory marker of where the turn
+    # started. The marker is never persisted and is removed when the turn ends.
+    turn_compression_tool_call_threshold: int | None = None
+    turn_start_mark: dict | None = None
+    turn_compression_applied: bool = False
+    turn_compression_error: str | None = None
 
     def add_messages(self, messages):
         self.messages.extend(deepcopy(messages))
@@ -56,6 +63,27 @@ class Context:
                         return message["content"], self.messages[index + 1:]
                 raise ValueError("Compression boundary is missing; history needs recovery")
         return None, self.messages
+
+    def turn_messages(self):
+        """Records after this turn's start marker (empty without a marker)."""
+        for index, message in enumerate(self.messages):
+            if message is self.turn_start_mark:
+                return self.messages[index + 1:]
+        return []
+
+    def turn_tool_call_count(self):
+        return sum(len(message.get("tool_calls") or []) for message in self.turn_messages()
+                   if message["role"] == "assistant" and message.get("deleted_at") is None)
+
+    @staticmethod
+    def replaced_message_ids(records):
+        """IDs hidden by a saved turn summary; its single write publishes the replacement."""
+        hidden = set()
+        for message in records:
+            if (message["role"] == "user" and message.get("name") == "turn_summary"
+                    and message.get("deleted_at") is None):
+                hidden.update(message.get("metadata", {}).get("replaced_message_ids") or [])
+        return hidden
 
     @property
     def turns_since_compression(self):
@@ -112,6 +140,9 @@ class Context:
     def model_messages(self):
         """Keep marks local and reject incomplete tool history before calling a model."""
         summary, records = self.active_history()
+        hidden = self.replaced_message_ids(records)
+        if hidden:
+            records = [message for message in records if message["id"] not in hidden]
         result = [{"role": "system", "content": self.system_prompt}] if self.system_prompt else []
         if summary is not None:
             result.append(self.summary_message(summary))

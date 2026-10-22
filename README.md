@@ -167,9 +167,10 @@ pre_run_turn(store, session_id, input_message, max_steps) → 新 ctx
       approve_tool_call(store, ctx, tool_call, tool)   # 每个工具执行前，async
     post_run_step(store, ctx)
     ...循环...
+should_compress_turn(ctx) → 满足条件则 compress_turn(...)   # 本轮压缩
 record_turn(store, ctx, count_tokens)
-should_compress(ctx) → 满足条件则 launch_compression_task(...)
-post_run_turn(store, ctx)
+should_compress(ctx) → 满足条件则 launch_compression_task(...)   # 全局压缩
+post_run_turn(store, ctx)            # 移除临时标记并释放状态
 ~~~
 
 所有 Hook 均为 classmethod；除 `should_compress` 为同步外，其余均为 async。覆盖时按需调用 `super()`。`on_event` 回调接收 step_start / step_end 事件副本，异常只记日志不影响对话。
@@ -190,6 +191,10 @@ post_run_turn(store, ctx)
 
 压缩流程：以 compression_started mark 固定截止某个 turn_end 的边界 → 用 COMPRESSION_INSTRUCTION 总结边界前历史（无工具）→ 校验摘要非空、无工具调用、确实缩小上下文 → 原子写入 compression_completed mark 才生效，原始记录不删除。摘要作为带前缀的 user message 呈现，不会成为 system 指令。压缩失败（网络、空摘要、过长、写入失败、打断）时旧上下文保持有效，`ctx.compression_error` 说明原因，已完成的回复仍可返回。
 
+### 本轮压缩
+
+`TURN_COMPRESSION_TOOL_CALL_THRESHOLD`（默认 None 关闭）：单轮工具调用次数达到该值时，在写 turn_end 之前把本轮压缩为一条摘要。`pre_run_turn` 在内存中的 `ctx.messages` 里插入一个临时标记 `tmp_turn_start_mark`（从不写入 Store）；轮末若 stop_reason 为 completed 或 step_limit 且满足阈值，`compress_turn` 把标记替换为 `TURN_COMPRESSION_MARKER` 提示语，连同之前的上下文与标记之后的全部消息（含本轮用户输入与最终回复）以 `TURN_COMPRESSION_INSTRUCTION` 发给压缩模型。摘要以 name=turn_summary 的 user 消息写入，其 `metadata.replaced_message_ids` 列出被替换的消息，这次写入即原子生效；之后被替换消息被软删除。摘要无效、未缩小上下文或被打断时保留原始本轮记录，`ctx.turn_compression_error` 说明原因。无论是否压缩，`post_run_turn` 都会移除临时标记。本轮压缩完成后才统计 token 并判断全局压缩，因此全局阈值看到的是压缩后的上下文。
+
 `COUNT_TOKENS` 可注入与实际模型匹配的 tokenizer（计入适配器额外注入的内容）；默认按 UTF-8 JSON 字节数除以 3 粗略估算。空闲期可绕过用户输入直接压缩：
 
 ~~~python
@@ -204,7 +209,7 @@ ctx = await Assistant.compress_session(
 
 ## Store 与消息
 
-store 是调用方传入的数据访问对象，框架不创建、初始化或关闭它；实现无须继承 `Store` 协议，满足方法约定即可。协议方法可同步可异步、可以混用：异步实现（例如包一层 async 数据库驱动）的返回值由框架透明 await；宿主在自己的 Hook 里需要同样行为时可用 `maybe_await`。消息为普通字典，`type` 是与模型 `role` 独立的业务分类（signal / memory / extra / None），Store 保留显式值、不按 role 猜测。框架保留 mark 名称 turn_end、compression_started、compression_completed。
+store 是调用方传入的数据访问对象，框架不创建、初始化或关闭它；实现无须继承 `Store` 协议，满足方法约定即可。协议方法可同步可异步、可以混用：异步实现（例如包一层 async 数据库驱动）的返回值由框架透明 await；宿主在自己的 Hook 里需要同样行为时可用 `maybe_await`。消息为普通字典，`type` 是与模型 `role` 独立的业务分类（signal / memory / extra / None），Store 保留显式值、不按 role 猜测。框架保留 mark 名称 turn_end、compression_started、compression_completed，以及 user 消息名称 turn_summary。
 
 `stores.py` 提供 MemoryStore（测试/演示）与 SQLiteStore（单连接、短事务的文件参考实现，`initialize()` 显式建表）；生产服务应针对自己的数据库实现同一协议，连接与事务生命周期放在实现内部。`ctx.messages` 保留全部历史（含软删除）；`ctx.model_messages()` 按已提交摘要裁剪、过滤 mark 与软删除、校验工具配对后才交给模型。
 

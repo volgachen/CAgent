@@ -30,8 +30,10 @@ class Store(Protocol):
     names are reserved. Compression boundaries may refer to a turn_end mark,
     including a soft-deleted one. They use metadata.through_message_id (not the
     ordering anchor before_message_id). Saving a compression_completed mark
-    atomically publishes its summary. No additional database-specific methods
-    are required.
+    atomically publishes its summary. A user message named turn_summary is
+    likewise reserved: saving it atomically hides the records listed in its
+    metadata.replaced_message_ids, which the framework then soft-deletes. No
+    additional database-specific methods are required.
     """
 
     def create_session(self, session_id: str, user_id: str) -> dict:
