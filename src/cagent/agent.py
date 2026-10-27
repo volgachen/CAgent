@@ -421,6 +421,17 @@ class BaseAgent:
         }])
 
     @classmethod
+    def compression_request(cls, messages, instruction):
+        """Summarizer input: the normal model view, then the instruction as a user message.
+
+        The prefix (agent system prompt + projected history) matches a regular
+        model call, so prompt caches can be reused, and the request always ends
+        with a user message: some providers reject a trailing assistant message
+        (prefill). No tools are offered, so the reply must be plain text.
+        """
+        return list(messages) + [{"role": "user", "content": instruction}]
+
+    @classmethod
     def should_compress(cls, ctx):
         if ctx.stop_reason != "completed" or ctx.turns_since_compression == 0:
             return False
@@ -459,13 +470,13 @@ class BaseAgent:
                           content=cls.TURN_COMPRESSION_MARKER)
             history = [marker if m is ctx.turn_start_mark else m for m in ctx.messages]
             messages = Context(ctx.session_id, messages=history,
+                               system_prompt=ctx.system_prompt,
                                tool_image_limit=ctx.tool_image_limit).model_messages()
             tools = cls.tool_definitions(ctx)
             before = await cls.count_context_tokens(ctx.model_messages(), tools, count_tokens)
             messages = await cls.prepare_model_messages(store, ctx, messages)
-            output = model(
-                messages=[{"role": "system", "content": cls.TURN_COMPRESSION_INSTRUCTION}]
-                + messages, tools=[])
+            output = model(messages=cls.compression_request(
+                messages, cls.TURN_COMPRESSION_INSTRUCTION), tools=[])
             if inspect.isawaitable(output):
                 output = await output
             if (not isinstance(output, dict) or not isinstance(output.get("content"), str)
@@ -552,6 +563,7 @@ class BaseAgent:
                            and m["metadata"]["stop_reason"] == "completed")
             boundary = next(i for i, m in enumerate(ctx.messages) if m["id"] == through)
             messages = Context(ctx.session_id, messages=ctx.messages[:boundary + 1],
+                               system_prompt=ctx.system_prompt,
                                tool_image_limit=ctx.tool_image_limit).model_messages()
             started = (await append_messages(store, ctx, [{
                 "role": "mark", "name": "compression_started",
@@ -560,9 +572,8 @@ class BaseAgent:
             before = await cls.count_context_tokens(ctx.model_messages(), cls.tool_definitions(ctx), count_tokens)
             # Images are sent with the history so the summary can describe them.
             messages = await cls.prepare_model_messages(store, ctx, messages)
-            output = model(
-                messages=[{"role": "system", "content": cls.COMPRESSION_INSTRUCTION}] + messages,
-                tools=[])
+            output = model(messages=cls.compression_request(
+                messages, cls.COMPRESSION_INSTRUCTION), tools=[])
             if inspect.isawaitable(output):
                 output = await output
             if (not isinstance(output, dict) or not isinstance(output.get("content"), str)

@@ -44,7 +44,10 @@ class CompressionContract:
         async def summarizer(*, messages, tools):
             requests.append(messages)
             self.assertEqual(tools, [])
-            self.assertEqual(messages[0]["role"], "system")
+            # Same prefix as a normal model call, instruction last as a user turn.
+            self.assertEqual(messages[0], {"role": "system", "content": BaseAgent.SYSTEM_PROMPT})
+            self.assertEqual(messages[-1], {"role": "user", "content": BaseAgent.COMPRESSION_INSTRUCTION})
+            self.assertEqual(sum(m["role"] == "system" for m in messages), 1)
             self.assertEqual(self.store.get_status("s"), "RUNNING")
             return {"content": f"Summary {len(requests)}"}
 
@@ -94,6 +97,27 @@ class CompressionContract:
         self.assertFalse(result.compression_applied)
         self.assertEqual(sum(m.get("name") == "turn_end" for m in self.store.list_messages("s")),
                          original_turns)
+
+    async def test_summary_request_reuses_prefix_and_ends_with_user(self):
+        # Providers such as Bedrock Claude reject a trailing assistant message
+        # (prefill); the instruction must arrive as the final user message,
+        # after the same system prompt + history a normal call would send.
+        await self.turn(compression_token_threshold=None, compression_turn_threshold=None)
+        requests = []
+
+        async def summarizer(*, messages, tools):
+            requests.append((messages, tools))
+            return {"content": "Summary"}
+
+        result = await BaseAgent.compress_session(
+            session_id="s", store=self.store, model=summarizer, system_prompt="Persona X")
+        self.assertTrue(result.compression_applied)
+        messages, tools = requests[0]
+        self.assertEqual(tools, [])
+        self.assertEqual(messages[0], {"role": "system", "content": "Persona X"})
+        self.assertEqual([m["role"] for m in messages[1:]], ["user", "assistant", "user"])
+        self.assertEqual(messages[1]["content"], LONG)
+        self.assertEqual(messages[-1], {"role": "user", "content": BaseAgent.COMPRESSION_INSTRUCTION})
 
     async def test_invalid_summary_keeps_original_history_and_allows_retry(self):
         for output in ({"content": ""}, {"content": LONG * 10},

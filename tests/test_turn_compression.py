@@ -64,8 +64,12 @@ class TurnCompressionContract:
         self.assertEqual(ctx.reply, "40 and 12 bags.")
 
         # The summarizer saw earlier context, then the marker, then this turn.
+        # The request reuses the normal prefix (agent system prompt + history)
+        # and ends with the instruction as a user message (no prefill).
         sent = requests[0]
-        self.assertEqual(sent[0]["content"], BaseAgent.TURN_COMPRESSION_INSTRUCTION)
+        self.assertEqual(sent[0], {"role": "system", "content": BaseAgent.SYSTEM_PROMPT})
+        self.assertEqual(sent[-1], {"role": "user", "content": BaseAgent.TURN_COMPRESSION_INSTRUCTION})
+        self.assertEqual(sum(m["role"] == "system" for m in sent), 1)
         contents = [m["content"] for m in sent]
         marker = contents.index(BaseAgent.TURN_COMPRESSION_MARKER)
         self.assertEqual(contents[marker - 2:marker], ["hello", "hi"])
@@ -164,7 +168,7 @@ class TurnCompressionContract:
         order = []
 
         async def summarizer(*, messages, tools):
-            order.append(messages[0]["content"])
+            order.append(messages[-1]["content"])
             return {"content": "Short summary."}
 
         await self.turn(scripted({"content": "noted"}), text=BIG)

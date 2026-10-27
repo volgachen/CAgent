@@ -190,7 +190,9 @@ post_run_turn(store, ctx)            # 移除临时标记并释放状态
 
 每轮结束写入 turn_end mark（stop_reason、num_tokens、usage 等）。三个条件任一满足即触发：有效上下文 token 达到 `COMPRESSION_TOKEN_THRESHOLD`、上次压缩后完成轮数达到 `COMPRESSION_TURN_THRESHOLD`、`FORCE_COMPRESSION=True`。阈值设 None 关闭；默认值仅为占位，应按实际模型调小。
 
-压缩流程：以 compression_started mark 固定截止某个 turn_end 的边界 → 用 COMPRESSION_INSTRUCTION 总结边界前历史（无工具）→ 校验摘要非空、无工具调用、确实缩小上下文 → 原子写入 compression_completed mark 才生效，原始记录不删除。摘要作为带前缀的 user message 呈现，不会成为 system 指令。压缩失败（网络、空摘要、过长、写入失败、打断）时旧上下文保持有效，`ctx.compression_error` 说明原因，已完成的回复仍可返回。
+压缩流程：以 compression_started mark 固定截止某个 turn_end 的边界 → 总结边界前历史（无工具）→ 校验摘要非空、无工具调用、确实缩小上下文 → 原子写入 compression_completed mark 才生效，原始记录不删除。摘要作为带前缀的 user message 呈现，不会成为 system 指令。压缩失败（网络、空摘要、过长、写入失败、打断）时旧上下文保持有效，`ctx.compression_error` 说明原因，已完成的回复仍可返回。
+
+压缩请求的格式：与普通模型调用相同的前缀（Agent 的 system prompt + 投影后的历史），末尾追加一条内容为 `COMPRESSION_INSTRUCTION`（单轮压缩为 `TURN_COMPRESSION_INSTRUCTION`）的 user 消息，`tools=[]`。前缀一致便于复用提示缓存；请求总以 user 消息结尾，兼容不支持 assistant 预填充（prefill）的模型（如 Bedrock 上的 Claude）。压缩指令不再作为 system message 发送。
 
 ### 本轮压缩
 
