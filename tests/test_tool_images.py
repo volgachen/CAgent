@@ -63,6 +63,22 @@ class ToolResultValidationTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 ToolResult("x", **kwargs)
 
+    def test_interleaved_content_is_split_into_text_and_placed_images(self):
+        result = ToolResult(["Page 1:", Image(URL_A), " Page 2:", Image(URL_B, detail="low"), " end"])
+        self.assertEqual(result.content, "Page 1: Page 2: end")
+        self.assertEqual(result.images, [{"ref": URL_A, "at": 7},
+                                         {"ref": URL_B, "detail": "low", "at": 15}])
+        self.assertEqual(ToolResult((Image(URL_A),)).images, [{"ref": URL_A, "at": 0}])
+
+    def test_invalid_interleaved_content_is_rejected(self):
+        for content, kwargs in (([], {}), ([" "], {}), (["x", 1], {}),
+                                (["x", {"ref": URL_A}], {}), (["x", Image("")], {}),
+                                (["x", Image(URL_A)], {"images": [URL_B]})):
+            with self.subTest(content=content), self.assertRaises(ValueError):
+                ToolResult(content, **kwargs)
+        with self.assertRaises(TypeError):
+            ToolResult(None)
+
 
 class ToolImageContract:
     def setUp(self):
@@ -71,6 +87,48 @@ class ToolImageContract:
 
     async def run_agent(self, agent, model, text="look"):
         return await agent.run_turn(text, session_id="s", store=self.store, model=model, pipeline=[])
+
+    async def test_interleaved_tool_result_keeps_order_for_the_model(self):
+        def pages(*, store, ctx, agent_cls):
+            return ToolResult(["Page 1:", Image(URL_A), "Page 2:", Image(URL_B, detail="low"), "done"],
+                              metadata={"pages": 2})
+
+        class Agent(BaseAgent):
+            @classmethod
+            def get_tools(cls, ctx):
+                return {"shot": Tool(pages)}
+
+        model, calls = recording({"tool_calls": [call("c1")]}, {"content": "ok"})
+        await self.run_agent(Agent, model)
+        content = tool_messages(calls[1])[0]["content"]
+        self.assertEqual(content, [
+            {"type": "text", "text": "Page 1:"},
+            {"type": "image_url", "image_url": {"url": URL_A}},
+            {"type": "text", "text": "Page 2:"},
+            {"type": "image_url", "image_url": {"url": URL_B, "detail": "low"}},
+            {"type": "text", "text": "done"},
+        ])
+        stored = [m for m in self.store.list_messages("s") if m["role"] == "tool"][0]
+        self.assertEqual(stored["content"], "Page 1:Page 2:done")
+        self.assertEqual(stored["metadata"], {"pages": 2, "images": [
+            {"ref": URL_A, "at": 7}, {"ref": URL_B, "detail": "low", "at": 14}]})
+
+    async def test_interleaved_tool_result_respects_the_limit(self):
+        def pages(*, store, ctx, agent_cls):
+            return ToolResult(["A:", Image(URL_A), "B:", Image(URL_B), "end"])
+
+        class Agent(BaseAgent):
+            TOOL_IMAGE_LIMIT = 1
+
+            @classmethod
+            def get_tools(cls, ctx):
+                return {"shot": Tool(pages)}
+
+        model, calls = recording({"tool_calls": [call("c1")]}, {"content": "ok"})
+        await self.run_agent(Agent, model)
+        content = tool_messages(calls[1])[0]["content"]
+        self.assertEqual([p.get("text") or p["image_url"]["url"] for p in content],
+                         ["A:B:", URL_B, "end" + Context.omitted_tool_images_note(1)])
 
     async def test_tool_images_reach_the_next_model_step(self):
         class Agent(BaseAgent):
@@ -246,9 +304,11 @@ class SQLiteToolImageTests(ToolImageContract, unittest.IsolatedAsyncioTestCase):
                 class Agent(BaseAgent):
                     @classmethod
                     def get_tools(cls, ctx):
-                        return {"shot": shot_tool([URL_A])}
+                        def pages(*, store, ctx, agent_cls):
+                            return ToolResult(["before ", Image(URL_A), " after"])
+                        return {"shot": shot_tool([URL_A]), "pages": Tool(pages)}
 
-                model, _ = recording({"tool_calls": [call("c1")]}, {"content": "ok"})
+                model, _ = recording({"tool_calls": [call("c1"), call("c2", "pages")]}, {"content": "ok"})
                 await Agent.run_turn("look", session_id="s", store=store, model=model, pipeline=[])
             finally:
                 store.close()
@@ -257,7 +317,10 @@ class SQLiteToolImageTests(ToolImageContract, unittest.IsolatedAsyncioTestCase):
                 model, calls = recording({"content": "still see it"})
                 await BaseAgent.run_turn("again", session_id="s", store=reopened,
                                          model=model, pipeline=[])
-                self.assertEqual(image_urls(tool_messages(calls[0])[0]["content"]), [URL_A])
+                results = tool_messages(calls[0])
+                self.assertEqual(image_urls(results[0]["content"]), [URL_A])
+                self.assertEqual([p["type"] for p in results[1]["content"]],
+                                 ["text", "image_url", "text"])
             finally:
                 reopened.close()
 

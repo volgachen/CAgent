@@ -8,7 +8,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 
 from .context import Context, append_messages
-from .images import Image, normalize_images as _normalize_images
+from .images import Image, normalize_images as _normalize_images, split_interleaved as _split_interleaved
 from .storage import Store, maybe_await
 from .tools import execute_tool_call
 
@@ -348,19 +348,7 @@ class BaseAgent:
         the character offset in content where it appears, so the model sees
         text and images in the original order.
         """
-        content, images = "", []
-        for part in parts:
-            if isinstance(part, str):
-                content += part
-            elif isinstance(part, Image):
-                image = cls.normalize_images([part])[0]
-                image["at"] = len(content)
-                images.append(image)
-            else:
-                raise ValueError("Interleaved input may only contain text strings and Image objects")
-        if not images and not content.strip():
-            raise ValueError("Interleaved input needs non-empty text or at least one image")
-        return content, images
+        return _split_interleaved(parts, cls.normalize_images)
 
     @classmethod
     async def resolve_image(cls, store, ctx, image):

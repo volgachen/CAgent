@@ -44,3 +44,27 @@ def normalize_images(images):
             raise ValueError("Image detail must be auto, low or high")
         result.append(dict(item))
     return result
+
+
+def split_interleaved(parts, normalize=normalize_images):
+    """Split ["text", Image(...), ...] into stored text plus images placed by offset.
+
+    Text segments are concatenated into content; each image records "at", the
+    character offset in content where it appears, so the model sees text and
+    images in the original order. Shared by user input and ToolResult.
+    """
+    if not isinstance(parts, (list, tuple)):
+        raise ValueError("Interleaved content must be a list of text strings and Image objects")
+    content, images = "", []
+    for part in parts:
+        if isinstance(part, str):
+            content += part
+        elif isinstance(part, Image):
+            image = normalize([part])[0]
+            image["at"] = len(content)
+            images.append(image)
+        else:
+            raise ValueError("Interleaved input may only contain text strings and Image objects")
+    if not images and not content.strip():
+        raise ValueError("Interleaved input needs non-empty text or at least one image")
+    return content, images

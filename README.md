@@ -121,6 +121,7 @@ class Assistant(BaseAgent):
 工具返回 `ToolResult(content="已截图", images=["file:42", {"ref": "https://...", "detail": "low"}])` 即可把图片交给模型。`images` 的写法与用户输入图片相同（引用字符串、`Image` 或 `{ref, detail}`），在构造时校验；入库时存为 tool 消息的 `metadata.images`（只存引用，`"images"` 因此是保留键，不能再放进 `metadata`）。
 
 - 发给模型时，tool 消息的 content 变为 `[文本, image_url, ...]`，引用同样经 `resolve_image` 解析、本轮内缓存。出错、被拒绝或被跳过的工具结果不带图。
+- 图文交错：`content` 也可以和用户输入一样传交错列表，`ToolResult(["第 1 页：", Image("file:1"), "第 2 页：", Image("file:2", detail="low")], metadata={...})`，模型看到的顺序与列表一致。构造后 `content` 是拼接后的文本，`images` 中每张图带 `at`（在文本中的字符偏移）；交错写法不能再同时传 `images=`。被 `TOOL_IMAGE_LIMIT` 省略的图片连同位置一起去掉。`tool_images="user_message"` 模式下图片会集中移到后续 user 消息，交错顺序不保留。
 - `TOOL_IMAGE_LIMIT = N` 只把最近 N 张工具图片发给模型（`None` 全部保留，`0` 全部不发），更早的替换为“[k earlier tool image(s) omitted]”文字；用户图片不受影响，入库的引用也不删除。压缩时同样遵守该限制。浏览器截图这类每步都产生图片的工具建议设一个小值。
 - 线上格式：Chat Completions 已发布的 schema 只允许 tool 消息带文本，Responses API 的 `function_call_output` 则支持图片；很多网关在 Chat Completions 下也接受 tool 消息带图。`make_openai_model(tool_images="inline")`（默认）保持图片在 tool 消息内；严格按 schema 校验的端点用 `tool_images="user_message"`，图片会移到这批工具结果之后的一条 user 消息里，并注明是工具输出而非用户指令。自己写模型适配器的宿主可直接调用 `relocate_tool_images(messages)` 得到同样效果。
 - 工具用 `Tool.result_type` 声明成功结果的消息分类（signal / memory / extra，默认 extra）；失败结果一律 extra。分类跟随工具定义，换注册名仍有效。
