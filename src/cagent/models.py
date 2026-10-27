@@ -72,7 +72,7 @@ def make_openai_model(*, base_url, model_name, api_key="", reasoning_effort=None
         raise ValueError("tool_images must be 'inline' or 'user_message'")
     endpoint = base_url.rstrip("/") + "/chat/completions"
 
-    def request_model(messages, tools):
+    def request_model(messages, tools, tool_choice=None):
         if tool_images == "user_message":
             messages = relocate_tool_images(messages)
         wire_messages = []
@@ -91,6 +91,8 @@ def make_openai_model(*, base_url, model_name, api_key="", reasoning_effort=None
             payload["reasoning_effort"] = reasoning_effort
         if tools:
             payload["tools"] = [{"type": "function", "function": tool} for tool in tools]
+            if tool_choice is not None:
+                payload["tool_choice"] = tool_choice
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -121,7 +123,9 @@ def make_openai_model(*, base_url, model_name, api_key="", reasoning_effort=None
             raise ModelError("模型没有返回有效的文字或工具调用，请检查接口响应格式。") from None
         return {"content": content, "tool_calls": calls, "usage": data.get("usage")}
 
-    async def model(*, messages, tools):
-        return await asyncio.to_thread(request_model, messages, tools)
+    async def model(*, messages, tools, tool_choice=None):
+        # tool_choice is sent only alongside tools (e.g. "none" for summarizer
+        # requests that carry the agent's tools; see COMPRESSION_SEND_TOOLS).
+        return await asyncio.to_thread(request_model, messages, tools, tool_choice)
 
     return model

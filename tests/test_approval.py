@@ -8,7 +8,7 @@ from cagent.stores import MemoryStore
 def scripted(*outputs):
     iterator = iter(outputs)
 
-    async def model(*, messages, tools):
+    async def model(*, messages, tools, tool_choice=None):
         return next(iterator)
 
     return model
@@ -47,7 +47,7 @@ class ApprovalTests(unittest.IsolatedAsyncioTestCase):
     async def test_denial_skips_execution_and_reports_reason_to_model(self):
         requests = []
 
-        async def model(*, messages, tools):
+        async def model(*, messages, tools, tool_choice=None):
             requests.append(messages)
             if len(requests) == 1:
                 return {"tool_calls": [call(arguments={"path": "/etc/passwd"})]}
@@ -188,7 +188,7 @@ class ApprovalTests(unittest.IsolatedAsyncioTestCase):
     async def test_denial_can_queue_supplementary_instruction(self):
         requests = []
 
-        async def model(*, messages, tools):
+        async def model(*, messages, tools, tool_choice=None):
             requests.append(messages)
             if len(requests) == 1:
                 return {"tool_calls": [call(arguments={"target": "x"})]}

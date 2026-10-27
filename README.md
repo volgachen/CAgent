@@ -46,7 +46,7 @@ class Assistant(BaseAgent):
 store = MemoryStore()
 store.create_session("demo", "user")
 
-async def model(*, messages, tools):
+async def model(*, messages, tools, tool_choice=None):
     # 适配器在这里调用真实模型；也可用 cagent.make_openai_model
     return {"tool_calls": [{"id": "c1", "name": "finish",
                             "arguments": {"content": "你好！"}}]}
@@ -190,9 +190,11 @@ post_run_turn(store, ctx)            # 移除临时标记并释放状态
 
 每轮结束写入 turn_end mark（stop_reason、num_tokens、usage 等）。三个条件任一满足即触发：有效上下文 token 达到 `COMPRESSION_TOKEN_THRESHOLD`、上次压缩后完成轮数达到 `COMPRESSION_TURN_THRESHOLD`、`FORCE_COMPRESSION=True`。阈值设 None 关闭；默认值仅为占位，应按实际模型调小。
 
-压缩流程：以 compression_started mark 固定截止某个 turn_end 的边界 → 总结边界前历史（无工具）→ 校验摘要非空、无工具调用、确实缩小上下文 → 原子写入 compression_completed mark 才生效，原始记录不删除。摘要作为带前缀的 user message 呈现，不会成为 system 指令。压缩失败（网络、空摘要、过长、写入失败、打断）时旧上下文保持有效，`ctx.compression_error` 说明原因，已完成的回复仍可返回。
+压缩流程：以 compression_started mark 固定截止某个 turn_end 的边界 → 总结边界前历史（禁止工具调用）→ 校验摘要非空、无工具调用、确实缩小上下文 → 原子写入 compression_completed mark 才生效，原始记录不删除。摘要作为带前缀的 user message 呈现，不会成为 system 指令。压缩失败（网络、空摘要、过长、写入失败、打断）时旧上下文保持有效，`ctx.compression_error` 说明原因，已完成的回复仍可返回。
 
-压缩请求的格式：与普通模型调用相同的前缀（Agent 的 system prompt + 投影后的历史），末尾追加一条内容为 `COMPRESSION_INSTRUCTION`（单轮压缩为 `TURN_COMPRESSION_INSTRUCTION`）的 user 消息，`tools=[]`。前缀一致便于复用提示缓存；请求总以 user 消息结尾，兼容不支持 assistant 预填充（prefill）的模型（如 Bedrock 上的 Claude）。压缩指令不再作为 system message 发送。
+压缩请求的格式：与普通模型调用相同的前缀（Agent 的 system prompt + 投影后的历史），末尾追加一条内容为 `COMPRESSION_INSTRUCTION`（单轮压缩为 `TURN_COMPRESSION_INSTRUCTION`）的 user 消息，工具见下方 `COMPRESSION_SEND_TOOLS`。前缀一致便于复用提示缓存；请求总以 user 消息结尾，兼容不支持 assistant 预填充（prefill）的模型（如 Bedrock 上的 Claude）。压缩指令不再作为 system message 发送。
+
+`COMPRESSION_SEND_TOOLS`（默认 True）：两种压缩请求都带上 Agent 的真实工具定义并传 `tool_choice="none"`，在接口层面禁止调用工具。只传 `tools=[]` 并不能阻止工具调用：历史里满是工具调用时，不少端点仍会让模型返回工具调用（部分网关会为这类历史自动补工具配置），压缩随之失败。带上同样的工具定义还让请求前缀与普通步骤完全一致，更易命中提示缓存。模型回调须接受 `tool_choice` 关键字参数（`make_openai_model` 已支持，且只在带工具时发送）；设为 False 恢复旧行为（`tools=[]`，不传 `tool_choice`），适合只接受两个参数的旧回调。
 
 ### 本轮压缩
 
@@ -208,7 +210,7 @@ ctx = await Assistant.compress_session(
 
 ## 模型适配器
 
-`make_openai_model(base_url=..., model_name=..., api_key=..., reasoning_effort=None, tool_images="inline")` 返回兼容任何 OpenAI 风格端点（vLLM、Ollama、OpenRouter、各类代理网关等）的异步模型，负责工具定义、调用与结果的线上格式转换；请求在后台线程执行。`reasoning_effort` 仅在提供时发送；`tool_images` 见“工具返回图片”；`ModelError` 不回显响应体。人设通过 `system_prompt` 参数传入，适配器不额外添加。
+`make_openai_model(base_url=..., model_name=..., api_key=..., reasoning_effort=None, tool_images="inline")` 返回兼容任何 OpenAI 风格端点（vLLM、Ollama、OpenRouter、各类代理网关等）的异步模型 `model(*, messages, tools, tool_choice=None)`，负责工具定义、调用与结果的线上格式转换；请求在后台线程执行。`reasoning_effort` 仅在提供时发送；`tool_images` 见“工具返回图片”；`ModelError` 不回显响应体。人设通过 `system_prompt` 参数传入，适配器不额外添加。
 
 ## Store 与消息
 

@@ -60,6 +60,14 @@ class BaseAgent:
     # Send only the most recent N tool-result images to the model (None keeps
     # all, 0 drops all); older ones become a text note. User images are kept.
     TOOL_IMAGE_LIMIT = None
+    # Summarizer requests (global and turn-scoped) normally go out with tools=[].
+    # Many endpoints still let the model emit tool calls when the history is
+    # full of them (some gateways re-add tool configs for such histories). With
+    # True, the summarizer gets the agent's real tool definitions plus
+    # tool_choice="none": tool calls are refused at the API level, and the
+    # request prefix matches a normal step so prompt caches can be reused. The
+    # model callable must then accept a tool_choice keyword argument.
+    COMPRESSION_SEND_TOOLS = True
 
     PIPELINE: list[str] = []
 
@@ -432,6 +440,18 @@ class BaseAgent:
         return list(messages) + [{"role": "user", "content": instruction}]
 
     @classmethod
+    async def call_summarizer(cls, model, ctx, messages, instruction):
+        """Send one summarizer request; see COMPRESSION_SEND_TOOLS for the tools sent."""
+        request = cls.compression_request(messages, instruction)
+        if cls.COMPRESSION_SEND_TOOLS:
+            output = model(messages=request, tools=cls.tool_definitions(ctx), tool_choice="none")
+        else:
+            output = model(messages=request, tools=[])
+        if inspect.isawaitable(output):
+            output = await output
+        return output
+
+    @classmethod
     def should_compress(cls, ctx):
         if ctx.stop_reason != "completed" or ctx.turns_since_compression == 0:
             return False
@@ -475,10 +495,8 @@ class BaseAgent:
             tools = cls.tool_definitions(ctx)
             before = await cls.count_context_tokens(ctx.model_messages(), tools, count_tokens)
             messages = await cls.prepare_model_messages(store, ctx, messages)
-            output = model(messages=cls.compression_request(
-                messages, cls.TURN_COMPRESSION_INSTRUCTION), tools=[])
-            if inspect.isawaitable(output):
-                output = await output
+            output = await cls.call_summarizer(
+                model, ctx, messages, cls.TURN_COMPRESSION_INSTRUCTION)
             if (not isinstance(output, dict) or not isinstance(output.get("content"), str)
                     or not output["content"].strip() or output.get("tool_calls")):
                 raise ValueError("Turn compression must return non-empty text without tool calls")
@@ -572,10 +590,8 @@ class BaseAgent:
             before = await cls.count_context_tokens(ctx.model_messages(), cls.tool_definitions(ctx), count_tokens)
             # Images are sent with the history so the summary can describe them.
             messages = await cls.prepare_model_messages(store, ctx, messages)
-            output = model(messages=cls.compression_request(
-                messages, cls.COMPRESSION_INSTRUCTION), tools=[])
-            if inspect.isawaitable(output):
-                output = await output
+            output = await cls.call_summarizer(
+                model, ctx, messages, cls.COMPRESSION_INSTRUCTION)
             if (not isinstance(output, dict) or not isinstance(output.get("content"), str)
                     or not output["content"].strip() or output.get("tool_calls")):
                 raise ValueError("Compression must return non-empty text without tool calls")

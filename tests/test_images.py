@@ -18,7 +18,7 @@ def recording(*outputs):
     """Scripted model that records the messages of every call."""
     iterator, calls = iter(outputs), []
 
-    async def model(*, messages, tools):
+    async def model(*, messages, tools, tool_choice=None):
         calls.append(messages)
         return next(iterator)
 
@@ -111,7 +111,7 @@ class ImageInputContract:
     async def test_compression_model_receives_images(self):
         summaries = []
 
-        async def summarizer(*, messages, tools):
+        async def summarizer(*, messages, tools, tool_choice=None):
             summaries.append(messages)
             return {"content": "User showed a cat photo; assistant identified it."}
 
@@ -136,7 +136,7 @@ class ImageInputContract:
                                    pipeline=[], images=["file:3"])
         seen = []
 
-        async def summarizer(*, messages, tools):
+        async def summarizer(*, messages, tools, tool_choice=None):
             seen.append(messages)
             return {"content": "Cat photo discussed."}
 

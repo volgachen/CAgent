@@ -3,14 +3,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cagent import BaseAgent, Context
+from cagent import BaseAgent, Context, Tool
 from cagent.stores import MemoryStore, SQLiteStore
 
 
 LONG = "Guest A ordered a large latte. Guest B asked for an Americano. " * 30
 
 
-def counter(*, messages, tools):
+def counter(*, messages, tools, tool_choice=None):
     # Deterministic stand-in for a model-specific tokenizer.
     return sum(len(m["content"]) + 5 for m in messages) + len(tools) * 10
 
@@ -18,7 +18,7 @@ def counter(*, messages, tools):
 def scripted(*outputs):
     iterator = iter(outputs)
 
-    async def model(*, messages, tools):
+    async def model(*, messages, tools, tool_choice=None):
         return next(iterator)
 
     return model
@@ -38,10 +38,43 @@ class CompressionContract:
             kwargs.pop("input_message", LONG), session_id="s", store=self.store, pipeline=[],
             model=kwargs.pop("model", scripted({"content": "ok"})), **kwargs)
 
+    async def test_summarizer_gets_agent_tools_with_tool_choice_none_by_default(self):
+        seen = []
+
+        async def summarizer(*, messages, tools, tool_choice=None):
+            seen.append((tools, tool_choice))
+            return {"content": "Summary"}
+
+        class WithTool(BaseAgent):
+            COMPRESSION_TURN_THRESHOLD = 1
+            COMPRESSION_TOKEN_THRESHOLD = None
+            COMPRESSION_MODEL = summarizer
+            COUNT_TOKENS = counter
+
+            @classmethod
+            def get_tools(cls, ctx):
+                return {"clock": Tool(lambda **kw: "12:00", "Read the clock")}
+
+        ctx = await WithTool.run_turn(LONG, session_id="s", store=self.store, pipeline=[],
+                                      model=scripted({"content": "ok"}))
+        self.assertTrue(ctx.compression_applied)
+        tools, tool_choice = seen[0]
+        self.assertEqual([t["name"] for t in tools], ["clock"])
+        self.assertEqual(tool_choice, "none")
+
+    async def test_summarizer_tool_calls_are_rejected(self):
+        async def summarizer(*, messages, tools, tool_choice=None):
+            return {"content": "checking", "tool_calls": [{"id": "x", "name": "bash", "arguments": {}}]}
+
+        ctx = await self.turn(compression_token_threshold=None, compression_turn_threshold=1,
+                              compression_model=summarizer, count_tokens=counter)
+        self.assertFalse(ctx.compression_applied)
+        self.assertIn("without tool calls", ctx.compression_error)
+
     async def test_threshold_turns_rolling_summary_and_original_reply(self):
         requests = []
 
-        async def summarizer(*, messages, tools):
+        async def summarizer(*, messages, tools, tool_choice=None):
             requests.append(messages)
             self.assertEqual(tools, [])
             # Same prefix as a normal model call, instruction last as a user turn.
@@ -105,7 +138,7 @@ class CompressionContract:
         await self.turn(compression_token_threshold=None, compression_turn_threshold=None)
         requests = []
 
-        async def summarizer(*, messages, tools):
+        async def summarizer(*, messages, tools, tool_choice=None):
             requests.append((messages, tools))
             return {"content": "Summary"}
 
@@ -136,7 +169,7 @@ class CompressionContract:
         await self.turn(compression_token_threshold=None, compression_turn_threshold=None)
         self.store.save_messages("s", [{"role": "user", "content": "Arrived after finished turn"}])
 
-        async def summary(*, messages, tools):
+        async def summary(*, messages, tools, tool_choice=None):
             self.assertFalse(any(m["content"] == "Arrived after finished turn" for m in messages))
             return {"content": "Summary"}
 
@@ -150,7 +183,7 @@ class CompressionContract:
         self.store.delete_message("s", first.turn_id)
         seen = []
 
-        async def model(*, messages, tools):
+        async def model(*, messages, tools, tool_choice=None):
             seen.extend(messages)
             return {"content": ""}
 
@@ -160,7 +193,7 @@ class CompressionContract:
         self.assertIsNone(second.reply)
 
     async def test_summary_provider_failure_does_not_fail_successful_turn(self):
-        async def broken(*, messages, tools):
+        async def broken(*, messages, tools, tool_choice=None):
             raise RuntimeError("summary provider unavailable")
 
         ctx = await self.turn(force_compression=True, compression_model=broken)
@@ -170,7 +203,7 @@ class CompressionContract:
         self.assertEqual(self.store.get_status("s"), "IDLE")
 
     async def test_interruption_during_summary_keeps_original(self):
-        async def summary(*, messages, tools):
+        async def summary(*, messages, tools, tool_choice=None):
             self.store.set_status("s", "INTERRUPTED")
             return {"content": "Summary"}
 
@@ -184,7 +217,7 @@ class CompressionContract:
     async def test_cancellation_during_summary_propagates_without_commit(self):
         started = asyncio.Event()
 
-        async def waiting(*, messages, tools):
+        async def waiting(*, messages, tools, tool_choice=None):
             started.set()
             await asyncio.Event().wait()
 
@@ -224,7 +257,7 @@ class CompressionContract:
         self.assertEqual(first.turns_since_compression, 1)
         self.assertIsNone(first.reply)
 
-        async def summary(*, messages, tools):
+        async def summary(*, messages, tools, tool_choice=None):
             ids = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
             self.assertEqual(ids, ["one", "two"])
             return {"content": "No order was executed; both tools were unknown."}
@@ -234,7 +267,7 @@ class CompressionContract:
         self.assertTrue(second.compression_applied)
 
     async def test_failed_turn_records_stats_without_running_summary(self):
-        async def broken(*, messages, tools):
+        async def broken(*, messages, tools, tool_choice=None):
             raise RuntimeError("model unavailable")
 
         with self.assertRaisesRegex(RuntimeError, "model unavailable"):

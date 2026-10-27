@@ -13,7 +13,7 @@ def call(call_id="c", name="menu", arguments=None):
 def scripted(*outputs):
     iterator = iter(outputs)
 
-    async def model(*, messages, tools):
+    async def model(*, messages, tools, tool_choice=None):
         return next(iterator)
 
     return model
@@ -43,7 +43,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_full_tool_turn(self):
         requests = []
 
-        async def model(*, messages, tools):
+        async def model(*, messages, tools, tool_choice=None):
             requests.append(messages)
             self.assertEqual(tools[0]["name"], "menu")
             if len(requests) == 1:
@@ -106,7 +106,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         batch = [{"sender_id": "a", "content": "hello"}]
         requests = []
 
-        async def model(*, messages, tools):
+        async def model(*, messages, tools, tool_choice=None):
             requests.append(messages)
             started.set()
             await release.wait()
@@ -182,7 +182,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_interrupt_during_model_skips_tools_and_hides_draft(self):
         for has_tools in (True, False):
             with self.subTest(has_tools=has_tools):
-                async def model(*, messages, tools):
+                async def model(*, messages, tools, tool_choice=None):
                     self.store.set_status("s", "INTERRUPTED")
                     return {"content": "draft", "tool_calls": [call()] if has_tools else []}
 
@@ -263,7 +263,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         arrived, release = asyncio.Event(), asyncio.Event()
         calls = []
 
-        async def model(*, messages, tools):
+        async def model(*, messages, tools, tool_choice=None):
             calls.append(messages)
             if len(calls) == 2:
                 arrived.set()
@@ -281,7 +281,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancellation_updates_status_and_propagates(self):
         started = asyncio.Event()
 
-        async def waiting(*, messages, tools):
+        async def waiting(*, messages, tools, tool_choice=None):
             started.set()
             await asyncio.Event().wait()
 

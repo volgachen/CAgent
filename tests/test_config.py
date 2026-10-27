@@ -27,7 +27,7 @@ class ConfigTests(unittest.IsolatedAsyncioTestCase):
         pipeline = ["Analyze first", "Then speak"]
         tools = {"finish": FINISH_TOOL}
 
-        def model(*, messages, tools):
+        def model(*, messages, tools, tool_choice=None):
             requests.append(messages)
             if len(requests) == 1:
                 return {"content": "Intermediate analysis"}
@@ -79,7 +79,7 @@ class ConfigTests(unittest.IsolatedAsyncioTestCase):
         ready = asyncio.Event()
 
         async def run(name):
-            async def model(*, messages, tools):
+            async def model(*, messages, tools, tool_choice=None):
                 nonlocal arrived
                 self.assertEqual([tool["name"] for tool in tools], ["finish"])
                 self.assertEqual(messages[-1]["content"], f"Instruction {name}")
@@ -108,7 +108,7 @@ class ConfigTests(unittest.IsolatedAsyncioTestCase):
         store.create_session("s", "u")
         requests = []
 
-        def model(*, messages, tools):
+        def model(*, messages, tools, tool_choice=None):
             requests.append(messages)
             return {"content": "Hello"}
 

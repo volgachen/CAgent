@@ -12,7 +12,7 @@ BIG = "Shelf 3 holds 40 bags of Ethiopian beans and 12 bags of Colombian beans. 
 def scripted(*outputs):
     iterator = iter(outputs)
 
-    async def model(*, messages, tools):
+    async def model(*, messages, tools, tool_choice=None):
         return next(iterator)
 
     return model
@@ -49,9 +49,11 @@ class TurnCompressionContract:
     async def test_turn_with_tool_call_is_replaced_by_summary(self):
         requests = []
 
-        async def summarizer(*, messages, tools):
+        async def summarizer(*, messages, tools, tool_choice=None):
             requests.append(messages)
-            self.assertEqual(tools, [])
+            # Default COMPRESSION_SEND_TOOLS: real tools, calls refused by the API.
+            self.assertEqual([t["name"] for t in tools], ["inventory"])
+            self.assertEqual(tool_choice, "none")
             self.assertEqual(self.store.get_status("s"), "RUNNING")
             return {"content": "User asked about beans; inventory shows 40 Ethiopian, 12 Colombian."}
 
@@ -95,6 +97,20 @@ class TurnCompressionContract:
         self.assertLess(live[-1]["metadata"]["num_tokens"],
                         live[-2]["metadata"]["num_tokens_before"])
         self.assertEqual(self.store.get_status("s"), "IDLE")
+
+    async def test_send_tools_off_sends_empty_tools_without_tool_choice(self):
+        seen = []
+
+        async def summarizer(*, messages, tools):
+            # Legacy two-argument callables keep working with the option off.
+            seen.append(tools)
+            return {"content": "Beans: 40 and 12."}
+
+        ctx = await self.turn(
+            scripted({"tool_calls": [call("a")]}, {"content": "40 and 12 bags."}),
+            COMPRESSION_MODEL=summarizer, COMPRESSION_SEND_TOOLS=False)
+        self.assertTrue(ctx.turn_compression_applied)
+        self.assertEqual(seen, [[]])
 
     async def test_below_threshold_or_disabled_keeps_turn(self):
         ctx = await self.turn(scripted({"content": "no tools"}), COMPRESSION_MODEL=scripted())
@@ -141,7 +157,7 @@ class TurnCompressionContract:
         self.assertFalse(ctx.turn_compression_applied)
         self.assertIsNone(ctx.turn_start_mark)
 
-        async def broken(*, messages, tools):
+        async def broken(*, messages, tools, tool_choice=None):
             raise RuntimeError("model down")
 
         self.store.set_status("s", "IDLE")
@@ -167,7 +183,7 @@ class TurnCompressionContract:
     async def test_global_compression_runs_after_turn_compression(self):
         order = []
 
-        async def summarizer(*, messages, tools):
+        async def summarizer(*, messages, tools, tool_choice=None):
             order.append(messages[-1]["content"])
             return {"content": "Short summary."}
 
@@ -185,7 +201,7 @@ class TurnCompressionContract:
                         COMPRESSION_MODEL=scripted({"content": "Beans: 40 and 12."}))
         seen = []
 
-        async def model(*, messages, tools):
+        async def model(*, messages, tools, tool_choice=None):
             seen.append(messages)
             return {"content": "ok"}
 
@@ -229,7 +245,7 @@ class SQLiteTurnCompressionTests(TurnCompressionContract, unittest.IsolatedAsync
             reopened = SQLiteStore(path)
             seen = []
 
-            async def model(*, messages, tools):
+            async def model(*, messages, tools, tool_choice=None):
                 seen.append(messages)
                 return {"content": "ok"}
 

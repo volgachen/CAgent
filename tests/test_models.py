@@ -53,6 +53,17 @@ class ModelAdapterTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(send.call_args.args[0].data)
         self.assertEqual(payload["reasoning_effort"], "low")
 
+    async def test_tool_choice_is_sent_only_with_tools(self):
+        response = {"choices": [{"message": {"content": "hi"}}]}
+        model = make_openai_model(base_url="https://example.invalid/v1", model_name="m")
+        definition = {"name": "clock", "description": "d", "parameters": {}}
+        with patch("cagent.models.urlopen", return_value=io.StringIO(json.dumps(response))) as send:
+            await model(messages=[], tools=[definition], tool_choice="none")
+        self.assertEqual(json.loads(send.call_args.args[0].data)["tool_choice"], "none")
+        with patch("cagent.models.urlopen", return_value=io.StringIO(json.dumps(response))) as send:
+            await model(messages=[], tools=[])
+        self.assertNotIn("tool_choice", json.loads(send.call_args.args[0].data))
+
     async def test_http_errors_are_explicit_and_do_not_leak_bodies(self):
         model = make_openai_model(base_url="https://example.invalid/v1", model_name="m",
                                   api_key="secret")

@@ -69,7 +69,7 @@ class Assistant(BaseAgent):
         return {"finish": FINISH_TOOL, "clock": CLOCK_TOOL}
 
 
-async def mock_model(*, messages, tools):
+async def mock_model(*, messages, tools, tool_choice=None):
     """离线固定规则，只验证工具循环、完成约定和多轮历史，不模拟真实理解。"""
     if messages[-1]["role"] == "tool":
         reply = f"现在的时间是{messages[-1]['content']}。"

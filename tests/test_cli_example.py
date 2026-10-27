@@ -47,7 +47,7 @@ class CliLoopTests(unittest.IsolatedAsyncioTestCase):
         store.create_session("s", "u")
         seen = []
 
-        async def model(*, messages, tools):
+        async def model(*, messages, tools, tool_choice=None):
             seen.append((messages, tools))
             return {"tool_calls": [{"id": "f", "name": "finish",
                                     "arguments": {"content": "done"}}]}

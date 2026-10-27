@@ -8,7 +8,7 @@ from cagent.stores import MemoryStore
 def scripted(*outputs):
     iterator = iter(outputs)
 
-    async def model(*, messages, tools):
+    async def model(*, messages, tools, tool_choice=None):
         return next(iterator)
 
     return model
@@ -90,7 +90,7 @@ class AsyncStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ctx.model_messages()[3]["tool_call_id"], "c")
 
     async def test_interrupt_is_observed_through_async_status_reads(self):
-        async def model(*, messages, tools):
+        async def model(*, messages, tools, tool_choice=None):
             await self.store.set_status("s", "INTERRUPTED")
             return {"content": "draft"}
 

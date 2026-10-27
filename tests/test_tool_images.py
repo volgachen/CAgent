@@ -18,7 +18,7 @@ DATA = "data:image/png;base64,iVBORw0KGgo="
 def recording(*outputs):
     iterator, calls = iter(outputs), []
 
-    async def model(*, messages, tools):
+    async def model(*, messages, tools, tool_choice=None):
         calls.append(messages)
         return next(iterator)
 
@@ -261,7 +261,7 @@ class ToolImageContract:
     async def test_compression_respects_the_limit(self):
         summaries = []
 
-        async def summarizer(*, messages, tools):
+        async def summarizer(*, messages, tools, tool_choice=None):
             summaries.append(messages)
             return {"content": "Summary of screenshots"}
 
