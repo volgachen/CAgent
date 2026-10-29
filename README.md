@@ -208,6 +208,19 @@ ctx = await Assistant.compress_session(
     system_prompt="你是一个简洁友好的中文助手。")  # 与正常对话一致，用于统计
 ~~~
 
+`compress_session` 还接受两个可选参数：
+
+- `instruction`：整个替换本次压缩的指令（默认 `COMPRESSION_INSTRUCTION`，区间压缩为 `RANGE_COMPRESSION_INSTRUCTION`）。
+- `since`：带时区的 `datetime` 或 ISO 字符串，只压缩从该时间开始的回合（区间压缩），更早的历史保持原样。区间按整轮对齐：从第一个"首条消息 `created_at >= since`"的回合开始，到最后一个已完成的 turn_end 为止；开始于 since 之前的回合整体保留。做法与本轮压缩相同：压缩模型看到之前的历史、`RANGE_COMPRESSION_MARKER` 提示语和区间内消息，摘要以 name=range_summary 的 user 消息（前缀 `RANGE_SUMMARY_PREFIX`）追加在末尾，`metadata.replaced_message_ids` 列出被替代的消息（turn_end 等 mark 保留），写入后原消息软删除。若 since 不晚于有效历史的第一个回合（即之前没有可保留的消息），退化为整段压缩。since 之后没有已完成回合时不压缩，`ctx.compression_skip_reason` 说明原因。成功时 `ctx.compression_kind` 为 `"session"` 或 `"range"`。
+
+~~~python
+from datetime import datetime, timedelta, timezone
+ctx = await Assistant.compress_session(
+    session_id=session_id, store=store, model=summary_model,
+    since=datetime.now(timezone.utc) - timedelta(hours=24),
+    instruction="把过去 24 小时的对话总结成要点，保留所有订单号。")
+~~~
+
 ## 模型适配器
 
 `make_openai_model(base_url=..., model_name=..., api_key=..., reasoning_effort=None, tool_images="inline")` 返回兼容任何 OpenAI 风格端点（vLLM、Ollama、OpenRouter、各类代理网关等）的异步模型 `model(*, messages, tools, tool_choice=None)`，负责工具定义、调用与结果的线上格式转换；请求在后台线程执行。`reasoning_effort` 仅在提供时发送；`tool_images` 见“工具返回图片”；`ModelError` 不回显响应体。人设通过 `system_prompt` 参数传入，适配器不额外添加。

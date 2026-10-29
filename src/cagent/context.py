@@ -6,6 +6,9 @@ from uuid import uuid4
 
 from .storage import Store, maybe_await
 
+# User rows that replace the records listed in metadata.replaced_message_ids.
+SUMMARY_NAMES = ("turn_summary", "range_summary")
+
 
 @dataclass
 class Context:
@@ -21,6 +24,10 @@ class Context:
     force_compression: bool = False
     compression_applied: bool = False
     compression_error: str | None = None
+    # External compression (compress_session): "session" or "range" once a
+    # summary was saved, and why a requested range was not compressed.
+    compression_kind: str | None = None
+    compression_skip_reason: str | None = None
     step_index: int = 0
     max_steps: int = 8
     stop_flag: bool = False
@@ -77,10 +84,10 @@ class Context:
 
     @staticmethod
     def replaced_message_ids(records):
-        """IDs hidden by a saved turn summary; its single write publishes the replacement."""
+        """IDs hidden by a saved turn or range summary; its single write publishes the replacement."""
         hidden = set()
         for message in records:
-            if (message["role"] == "user" and message.get("name") == "turn_summary"
+            if (message["role"] == "user" and message.get("name") in SUMMARY_NAMES
                     and message.get("deleted_at") is None):
                 hidden.update(message.get("metadata", {}).get("replaced_message_ids") or [])
         return hidden
