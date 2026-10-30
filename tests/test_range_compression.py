@@ -95,7 +95,7 @@ class RangeCompressionContract:
                                      model=scripted({"content": "fine"}))
         self.assertEqual(self.contents(fresh)[:4], [
             "old " + LONG, "old reply",
-            BaseAgent.RANGE_SUMMARY_PREFIX + "Range summary", "next"])
+            "Range summary", "next"])
         summary = next(m for m in self.store.list_messages("s") if m.get("name") == "range_summary")
         self.assertEqual(summary["role"], "user")
         self.assertEqual(len(summary["metadata"]["replaced_message_ids"]), 4)
@@ -128,28 +128,60 @@ class RangeCompressionContract:
         self.assertEqual(seen, [{"role": "user", "content": "Only list orders."},
                                 {"role": "user", "content": "Whole, briefly."}])
 
-    async def test_since_at_history_start_falls_back_to_whole_compression(self):
+    async def test_since_at_history_start_replaces_everything_with_a_range(self):
         await self.three_turns()
         ctx = await self.compress(T0 - timedelta(hours=1))
-        self.assertEqual(ctx.compression_kind, "session")
-        self.assertEqual(self.contents(ctx)[0],
-                         "Summary of earlier conversation:\nRange summary")
+        self.assertEqual(ctx.compression_kind, "range")
+        self.assertEqual(self.contents(ctx), ["Range summary"])
+        self.assertFalse(any(m.get("name") == "compression_completed"
+                             for m in self.store.list_messages("s")))
 
-    async def test_since_before_active_boundary_falls_back_to_whole_compression(self):
+    async def test_whole_summary_is_kept_when_since_reaches_into_it(self):
         await self.turn("old " + LONG, 0, "old reply")
         await self.at(1, BaseAgent.compress_session(
             session_id="s", store=self.store, count_tokens=counter,
             model=scripted({"content": "First summary"})))
         await self.turn("mid " + LONG, 10, "mid reply")
         await self.turn("new " + LONG, 20, "new reply")
-        # Hour 5 lies inside the compressed part; nothing older remains to keep.
+        # Hour 5 lies inside the summarized part: only the turns after it go.
         ctx = await self.compress(T0 + timedelta(hours=5))
-        self.assertEqual(ctx.compression_kind, "session")
-        # A later range keeps the turns after that summary.
-        await self.turn("between " + LONG, 27, "between reply")
-        await self.turn("later " + LONG, 30, "later reply")
-        ctx = await self.compress(T0 + timedelta(hours=28), hours=31)
         self.assertEqual(ctx.compression_kind, "range")
+        self.assertEqual(self.contents(ctx), ["First summary", "Range summary"])
+
+    async def test_daily_compression_keeps_each_day(self):
+        # Timeline of a real session: a whole-history summary from day 1, then
+        # day 2 browsing, then the day 2 summary with since = day 2, 07:00.
+        day1 = scripted({"content": "Day 1 diary"})
+        day2 = scripted({"content": "Day 2 diary"})
+        day3 = scripted({"content": "Day 3 diary"})
+        await self.turn("d1 morning " + LONG, 8, "d1 reply")
+        await self.compress(T0 + timedelta(hours=7), model=day1, hours=20)
+        for hour in (32, 33, 44):
+            await self.turn(f"d2 {hour} " + LONG, hour, f"d2 {hour} reply")
+        ctx = await self.compress(T0 + timedelta(hours=31), model=day2, hours=44.5)
+        self.assertEqual(ctx.compression_kind, "range", ctx.compression_error)
+        self.assertEqual(self.contents(ctx), ["Day 1 diary", "Day 2 diary"])
+        for hour in (56, 68):
+            await self.turn(f"d3 {hour} " + LONG, hour, f"d3 {hour} reply")
+        ctx = await self.compress(T0 + timedelta(hours=55), model=day3, hours=68.5)
+        self.assertEqual(ctx.compression_kind, "range", ctx.compression_error)
+        self.assertEqual(self.contents(ctx), ["Day 1 diary", "Day 2 diary", "Day 3 diary"])
+        summaries = [m for m in self.store.list_messages("s") if m.get("name") == "range_summary"]
+        self.assertEqual([m["content"] for m in summaries],
+                         ["Day 1 diary", "Day 2 diary", "Day 3 diary"])
+
+    async def test_daily_compression_after_a_whole_history_summary(self):
+        # The case that went wrong: day 1 was a whole-history summary (mark).
+        await self.turn("d1 " + LONG, 8, "d1 reply")
+        await self.at(20, BaseAgent.compress_session(
+            session_id="s", store=self.store, count_tokens=counter,
+            model=scripted({"content": "Day 1 diary"})))
+        for hour in (34, 44):
+            await self.turn(f"d2 {hour} " + LONG, hour, f"d2 {hour} reply")
+        ctx = await self.compress(T0 + timedelta(hours=31), hours=44.5,
+                                  model=scripted({"content": "Day 2 diary"}))
+        self.assertEqual(ctx.compression_kind, "range", ctx.compression_error)
+        self.assertEqual(self.contents(ctx), ["Day 1 diary", "Day 2 diary"])
 
     async def test_nothing_after_since_is_skipped(self):
         await self.three_turns()
@@ -173,26 +205,31 @@ class RangeCompressionContract:
         self.assertEqual(ctx.compression_kind, "range", ctx.compression_error)
         contents = self.contents(ctx)
         self.assertEqual(contents, ["old " + LONG, "old reply",
-                                    BaseAgent.RANGE_SUMMARY_PREFIX + "Range summary"])
+                                    "Range summary"])
 
     async def test_later_range_after_a_range_summary(self):
         await self.three_turns()
         await self.compress(T0 + timedelta(hours=5), model=scripted({"content": "First range"}))
         await self.turn("next " + LONG, 30, "next reply")
-        # since falls after the first range summary (hour 25): only the next turn.
-        ctx = await self.compress(T0 + timedelta(hours=26), hours=31,
+        # The first range summary covers from hour 10, written at hour 25. A since
+        # after hour 10 keeps it, even though it was written later.
+        ctx = await self.compress(T0 + timedelta(hours=11), hours=31,
                                   model=scripted({"content": "Second range"}))
         self.assertEqual(ctx.compression_kind, "range", ctx.compression_error)
         self.assertEqual(self.contents(ctx), [
-            "old " + LONG, "old reply", BaseAgent.RANGE_SUMMARY_PREFIX + "First range",
-            BaseAgent.RANGE_SUMMARY_PREFIX + "Second range"])
-        # since before it: the first summary is folded into a new one.
+            "old " + LONG, "old reply", "First range",
+            "Second range"])
+        # since at or before what it covers (hour 10): folded into a new one.
         await self.turn("last " + LONG, 40, "last reply")
-        ctx = await self.compress(T0 + timedelta(hours=24), hours=41,
+        ctx = await self.compress(T0 + timedelta(hours=10), hours=41,
                                   model=scripted({"content": "Merged"}))
         self.assertEqual(ctx.compression_kind, "range", ctx.compression_error)
         self.assertEqual(self.contents(ctx), [
-            "old " + LONG, "old reply", BaseAgent.RANGE_SUMMARY_PREFIX + "Merged"])
+            "old " + LONG, "old reply", "Merged"])
+        merged = next(m for m in self.store.list_messages("s") if m["content"] == "Merged")
+        # The merged summary covers from the first range's start (hour 10).
+        self.assertEqual(datetime.fromisoformat(merged["metadata"]["since"]),
+                         T0 + timedelta(hours=10))
 
     async def test_invalid_arguments(self):
         await self.three_turns()

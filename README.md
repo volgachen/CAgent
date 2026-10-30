@@ -190,7 +190,7 @@ post_run_turn(store, ctx)            # 移除临时标记并释放状态
 
 每轮结束写入 turn_end mark（stop_reason、num_tokens、usage 等）。三个条件任一满足即触发：有效上下文 token 达到 `COMPRESSION_TOKEN_THRESHOLD`、上次压缩后完成轮数达到 `COMPRESSION_TURN_THRESHOLD`、`FORCE_COMPRESSION=True`。阈值设 None 关闭；默认值仅为占位，应按实际模型调小。
 
-压缩流程：以 compression_started mark 固定截止某个 turn_end 的边界 → 总结边界前历史（禁止工具调用）→ 校验摘要非空、无工具调用、确实缩小上下文 → 原子写入 compression_completed mark 才生效，原始记录不删除。摘要作为带前缀的 user message 呈现，不会成为 system 指令。压缩失败（网络、空摘要、过长、写入失败、打断）时旧上下文保持有效，`ctx.compression_error` 说明原因，已完成的回复仍可返回。
+压缩流程：以 compression_started mark 固定截止某个 turn_end 的边界 → 总结边界前历史（禁止工具调用）→ 校验摘要非空、无工具调用、确实缩小上下文 → 原子写入 compression_completed mark 才生效，原始记录不删除。摘要作为 user message 呈现（原样发送，不加前缀），不会成为 system 指令。压缩失败（网络、空摘要、过长、写入失败、打断）时旧上下文保持有效，`ctx.compression_error` 说明原因，已完成的回复仍可返回。
 
 压缩请求的格式：与普通模型调用相同的前缀（Agent 的 system prompt + 投影后的历史），末尾追加一条内容为 `COMPRESSION_INSTRUCTION`（单轮压缩为 `TURN_COMPRESSION_INSTRUCTION`）的 user 消息，工具见下方 `COMPRESSION_SEND_TOOLS`。前缀一致便于复用提示缓存；请求总以 user 消息结尾，兼容不支持 assistant 预填充（prefill）的模型（如 Bedrock 上的 Claude）。压缩指令不再作为 system message 发送。
 
@@ -198,7 +198,7 @@ post_run_turn(store, ctx)            # 移除临时标记并释放状态
 
 ### 本轮压缩
 
-`TURN_COMPRESSION_TOOL_CALL_THRESHOLD`（默认 None 关闭）：单轮工具调用次数达到该值时，在写 turn_end 之前把本轮压缩为一条摘要。`pre_run_turn` 在内存中的 `ctx.messages` 里插入一个临时标记 `tmp_turn_start_mark`（从不写入 Store）；轮末若 stop_reason 为 completed 或 step_limit 且满足阈值，`compress_turn` 把标记替换为 `TURN_COMPRESSION_MARKER` 提示语，连同之前的上下文与标记之后的全部消息（含本轮用户输入与最终回复）以 `TURN_COMPRESSION_INSTRUCTION` 发给压缩模型。摘要以 name=turn_summary 的 user 消息写入，其 `metadata.replaced_message_ids` 列出被替换的消息，这次写入即原子生效；之后被替换消息被软删除。摘要无效、未缩小上下文或被打断时保留原始本轮记录，`ctx.turn_compression_error` 说明原因。无论是否压缩，`post_run_turn` 都会移除临时标记。本轮压缩完成后才统计 token 并判断全局压缩，因此全局阈值看到的是压缩后的上下文。
+`TURN_COMPRESSION_TOOL_CALL_THRESHOLD`（默认 None 关闭）：单轮工具调用次数达到该值时，在写 turn_end 之前把本轮压缩为一条摘要。`pre_run_turn` 在内存中的 `ctx.messages` 里插入一个临时标记 `tmp_turn_start_mark`（从不写入 Store）；轮末若 stop_reason 为 completed 或 step_limit 且满足阈值，`compress_turn` 把标记替换为 `TURN_COMPRESSION_MARKER` 提示语，连同之前的上下文与标记之后的全部消息（含本轮用户输入与最终回复）以 `TURN_COMPRESSION_INSTRUCTION` 发给压缩模型。摘要以 name=turn_summary 的 user 消息写入（只存摘要正文，不加前缀），其 `metadata.replaced_message_ids` 列出被替换的消息，这次写入即原子生效；之后被替换消息被软删除。摘要无效、未缩小上下文或被打断时保留原始本轮记录，`ctx.turn_compression_error` 说明原因。无论是否压缩，`post_run_turn` 都会移除临时标记。本轮压缩完成后才统计 token 并判断全局压缩，因此全局阈值看到的是压缩后的上下文。
 
 `COUNT_TOKENS` 可注入与实际模型匹配的 tokenizer（计入适配器额外注入的内容）；默认按 UTF-8 JSON 字节数除以 3 粗略估算。空闲期可绕过用户输入直接压缩：
 
@@ -211,7 +211,7 @@ ctx = await Assistant.compress_session(
 `compress_session` 还接受两个可选参数：
 
 - `instruction`：整个替换本次压缩的指令（默认 `COMPRESSION_INSTRUCTION`，区间压缩为 `RANGE_COMPRESSION_INSTRUCTION`）。
-- `since`：带时区的 `datetime` 或 ISO 字符串，只压缩从该时间开始的回合（区间压缩），更早的历史保持原样。区间按整轮对齐：从第一个"首条消息 `created_at >= since`"的回合开始，到最后一个已完成的 turn_end 为止；开始于 since 之前的回合整体保留。做法与本轮压缩相同：压缩模型看到之前的历史、`RANGE_COMPRESSION_MARKER` 提示语和区间内消息，摘要以 name=range_summary 的 user 消息（前缀 `RANGE_SUMMARY_PREFIX`）追加在末尾，`metadata.replaced_message_ids` 列出被替代的消息（turn_end 等 mark 保留），写入后原消息软删除。若 since 不晚于有效历史的第一个回合（即之前没有可保留的消息），退化为整段压缩。since 之后没有已完成回合时不压缩，`ctx.compression_skip_reason` 说明原因。成功时 `ctx.compression_kind` 为 `"session"` 或 `"range"`。
+- `since`：带时区的 `datetime` 或 ISO 字符串，只压缩从该时间开始的回合（区间压缩），更早的历史保持原样。区间按整轮对齐：从第一个"首条消息 `created_at >= since`"的回合开始，到最后一个已完成的 turn_end 为止；开始于 since 之前的回合整体保留。做法与本轮压缩相同：压缩模型看到之前的历史、`RANGE_COMPRESSION_MARKER` 提示语和区间内消息，摘要以 name=range_summary 的 user 消息（只存摘要正文）追加在末尾，`metadata.replaced_message_ids` 列出被替代的消息（turn_end 等 mark 保留），写入后原消息软删除。区间只在有效历史（最新整段摘要之后）里查找，所以之前的整段摘要总会保留；较早的区间摘要按 `metadata.since`（其覆盖内容的起点）而非写入时间判断是否落在区间内。since 之后没有已完成回合时不压缩，`ctx.compression_skip_reason` 说明原因。成功时 `ctx.compression_kind` 为 `"session"`（未传 since）或 `"range"`。
 
 ~~~python
 from datetime import datetime, timedelta, timezone

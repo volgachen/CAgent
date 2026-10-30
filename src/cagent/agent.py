@@ -45,7 +45,6 @@ class BaseAgent:
         "This message marks where summarization and compression begin. Summarize and "
         "compress the messages after this point."
     )
-    TURN_SUMMARY_PREFIX = "Summary of an earlier turn:\n"
 
     # Range compression (compress_session(since=...)): the completed turns from
     # a point in time through the last completed turn become one summary.
@@ -62,7 +61,6 @@ class BaseAgent:
         "This message marks where summarization and compression begin. Summarize and "
         "compress the messages after this point."
     )
-    RANGE_SUMMARY_PREFIX = "Summary of earlier messages:\n"
 
     MAX_STEPS = 32
     COMPRESSION_TOKEN_THRESHOLD = 1000000
@@ -522,7 +520,7 @@ class BaseAgent:
                 return
             summary = {
                 "role": "user", "name": "turn_summary",
-                "content": cls.TURN_SUMMARY_PREFIX + output["content"].strip(),
+                "content": output["content"].strip(),
                 "metadata": {"turn_id": ctx.turn_id, "replaced_message_ids": replaced},
             }
             preview = dict(summary, id=f"turn_summary_{ctx.turn_id}", deleted_at=None,
@@ -562,9 +560,9 @@ class BaseAgent:
         Without since, everything through the last completed turn is summarized
         (a compression_completed mark). With since (a timezone-aware datetime or
         ISO string), only the turns starting at or after it are summarized into
-        one range_summary user row; earlier history stays as it is. A since at
-        or before the start of the active history falls back to the whole
-        compression. instruction replaces the default summarizer instruction.
+        one range_summary user row; earlier history, including an earlier
+        whole-history summary, stays as it is. instruction replaces the default
+        summarizer instruction.
         ctx.compression_kind tells which one was saved; ctx.compression_skip_reason
         explains a range that had nothing to compress.
         """
@@ -594,8 +592,6 @@ class BaseAgent:
                 return ctx
         await maybe_await(store.set_status(session_id, "RUNNING"))
         try:
-            if selected == "session":
-                selected = None
             if selected is None:
                 await cls.launch_compression_task(store, ctx, model, count_tokens=count_tokens,
                                                   instruction=instruction)
@@ -640,9 +636,10 @@ class BaseAgent:
 
         Returns (start, end) indexes into ctx.messages: start is the first record
         of the earliest turn whose first message was created at or after since,
-        end is the last completed turn_end. Returns "session" when that turn
-        starts the active history (nothing older would stay), or None with
-        ctx.compression_skip_reason set when no completed turn qualifies.
+        end is the last completed turn_end. Only the active history (after the
+        whole-history summary, if any) is searched, so that summary always stays.
+        Returns None with ctx.compression_skip_reason set when no completed turn
+        qualifies.
         """
         _, records = ctx.active_history()
         offset = len(ctx.messages) - len(records)
@@ -650,38 +647,44 @@ class BaseAgent:
                     if records[i]["role"] == "mark" and records[i].get("name") == "turn_end"
                     and records[i].get("deleted_at") is None
                     and records[i]["metadata"]["stop_reason"] == "completed"), None)
-        start, turns_before, at_turn_start = None, 0, True
-        for index in range(offset, offset if end is None else end + 1):
+        # Segments of the active history: each range_summary row alone, and each
+        # turn (its records through its turn_end). A turn a range summary
+        # already replaced is covered by that summary's segment and skipped.
+        covered = set()
+        for message in records:
+            if (message["role"] == "user" and message.get("name") == "range_summary"
+                    and message.get("deleted_at") is None):
+                covered.update((message.get("metadata") or {}).get("replaced_message_ids") or [])
+        start, turn = None, []
+        last = offset - 1 if end is None else end
+        for index in range(offset, last + 1):
             message = ctx.messages[index]
-            if message["role"] == "mark":
-                if message.get("name") == "turn_end" and message.get("deleted_at") is None:
-                    at_turn_start = True
-                continue
-            if not at_turn_start:
-                continue
-            stamp = cls._created_at(message)
-            if message["role"] == "user" and message.get("name") == "range_summary":
-                # Saved between turns at compression time: a segment of its own.
+            if message["role"] == "user" and message.get("name") == "range_summary" and not turn:
+                # Dated by the start of what it covers, not by when it was written.
+                stamp = cls._created_at(
+                    {"created_at": (message.get("metadata") or {}).get("since")
+                     or message.get("created_at")})
                 if stamp is not None and stamp >= since:
                     start = index
                     break
-                turns_before += 1
+                continue
+            if message["role"] != "mark":
+                turn.append(index)
+            if not (message["role"] == "mark" and message.get("name") == "turn_end"
+                    and message.get("deleted_at") is None):
+                continue
+            records_of_turn, turn = turn, []
+            if not records_of_turn or any(ctx.messages[i]["id"] in covered for i in records_of_turn):
                 continue
             # A turn's time is its first record's, deleted or not (turn
             # compression soft-deletes the originals it replaces).
-            at_turn_start = False
+            stamp = cls._created_at(ctx.messages[records_of_turn[0]])
             if stamp is not None and stamp >= since:
-                start = index
+                start = records_of_turn[0]
                 break
-            turns_before += 1
         if start is None:
             ctx.compression_skip_reason = "no completed turns since the given time"
             return None
-        hidden = ctx.replaced_message_ids(records)
-        older = any(m["role"] != "mark" and m.get("deleted_at") is None and m["id"] not in hidden
-                    for m in ctx.messages[offset:start])
-        if not turns_before or not older:
-            return "session"
         return start, end
 
     @classmethod
@@ -726,11 +729,16 @@ class BaseAgent:
                 ctx.stop("interrupted")
                 return
             first = ctx.messages[start]
+            # What the summary covers starts where its first segment's content
+            # does: a range summary's own since, else the first record's time.
+            covered_since = first.get("created_at")
+            if first.get("name") == "range_summary":
+                covered_since = (first.get("metadata") or {}).get("since") or covered_since
             summary = {
                 "role": "user", "name": "range_summary",
-                "content": cls.RANGE_SUMMARY_PREFIX + output["content"].strip(),
+                "content": output["content"].strip(),
                 "metadata": {"replaced_message_ids": replaced,
-                             "since": first.get("created_at"),
+                             "since": covered_since,
                              "through_message_id": ctx.messages[end]["id"]},
             }
             preview = dict(summary, id=f"range_summary_{ctx.turn_id}", deleted_at=None,

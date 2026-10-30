@@ -83,7 +83,9 @@ class TurnCompressionContract:
         self.assertEqual([m["content"] for m in projected[1:3]], ["hello", "hi"])
         self.assertEqual(len(projected), 4)
         self.assertEqual(projected[3]["role"], "user")
-        self.assertTrue(projected[3]["content"].startswith(BaseAgent.TURN_SUMMARY_PREFIX))
+        # Stored and sent exactly as the summarizer wrote it, no prefix.
+        self.assertEqual(projected[3]["content"],
+                         "User asked about beans; inventory shows 40 Ethiopian, 12 Colombian.")
 
         # The temporary marker is gone and was never persisted.
         self.assertIsNone(ctx.turn_start_mark)
@@ -207,7 +209,7 @@ class TurnCompressionContract:
 
         await self.turn(model, text="Thanks")
         contents = [m["content"] for m in seen[0]]
-        self.assertEqual(contents[1], BaseAgent.TURN_SUMMARY_PREFIX + "Beans: 40 and 12.")
+        self.assertEqual(contents[1], "Beans: 40 and 12.")
         self.assertEqual(contents[2], "Thanks")
 
     async def test_threshold_is_validated(self):
@@ -253,7 +255,7 @@ class SQLiteTurnCompressionTests(TurnCompressionContract, unittest.IsolatedAsync
                                      pipeline=[])
             reopened.close()
             self.assertEqual([m["content"] for m in seen[0][1:]],
-                             [BaseAgent.TURN_SUMMARY_PREFIX + "Beans: 40 and 12.", "Next"])
+                             ["Beans: 40 and 12.", "Next"])
 
 
 if __name__ == "__main__":

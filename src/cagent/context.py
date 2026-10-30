@@ -103,7 +103,8 @@ class Context:
     @staticmethod
     def summary_message(content):
         # Summary is conversation data, never promoted to a system instruction.
-        return {"role": "user", "content": "Summary of earlier conversation:\n" + content}
+        # Sent as the summarizer wrote it, with no added prefix.
+        return {"role": "user", "content": content}
 
     @staticmethod
     def interleave(text, images):
