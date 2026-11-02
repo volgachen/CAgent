@@ -231,6 +231,48 @@ class RangeCompressionContract:
         self.assertEqual(datetime.fromisoformat(merged["metadata"]["since"]),
                          T0 + timedelta(hours=10))
 
+    async def step_limited_turn(self, text, hours):
+        """A turn cut off by MAX_STEPS right after a tool call and its result."""
+
+        class Limited(ToolAgent):
+            MAX_STEPS = 1
+
+        await self.turn(text, hours, agent=Limited, model=scripted(
+            {"tool_calls": [{"id": f"s{hours}", "name": "lookup", "arguments": {}}]}))
+
+    async def test_range_includes_step_limit_turns_even_as_the_last_turn(self):
+        await self.turn("old " + LONG, 0, "old reply")
+        await self.step_limited_turn("cut " + LONG, 10)
+        await self.turn("mid " + LONG, 15, "mid reply")
+        await self.step_limited_turn("last " + LONG, 20)
+        ctx = await self.compress(T0 + timedelta(hours=5))
+        self.assertEqual(ctx.compression_kind, "range", ctx.compression_error)
+        self.assertEqual(self.contents(ctx), ["old " + LONG, "old reply", "Range summary"])
+        summary = next(m for m in self.store.list_messages("s") if m.get("name") == "range_summary")
+        # Both step_limit turns (user, assistant call, tool result each) and
+        # the completed one in between.
+        self.assertEqual(len(summary["metadata"]["replaced_message_ids"]), 8)
+
+    async def test_whole_history_compression_after_a_step_limit_turn(self):
+        await self.turn("old " + LONG, 0, "old reply")
+        await self.step_limited_turn("last " + LONG, 10)
+        ctx = await self.compress(None, model=scripted({"content": "Whole summary"}))
+        self.assertEqual(ctx.compression_kind, "session", ctx.compression_error)
+        self.assertEqual(self.contents(ctx), ["Whole summary"])
+
+    async def test_failed_last_turn_still_blocks_compression(self):
+        await self.three_turns()
+
+        async def broken(*, messages, tools, tool_choice=None):
+            raise RuntimeError("provider down")
+
+        with self.assertRaises(RuntimeError):
+            await self.turn("boom", 21, model=broken)
+        self.store.set_status("s", "IDLE")
+        ctx = await self.compress(T0 + timedelta(hours=5))
+        self.assertFalse(ctx.compression_applied)
+        self.assertIsNone(ctx.compression_kind)
+
     async def test_invalid_arguments(self):
         await self.three_turns()
         for kwargs in ({"since": datetime(2026, 1, 1)}, {"since": "yesterday"},

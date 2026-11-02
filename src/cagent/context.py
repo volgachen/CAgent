@@ -9,6 +9,18 @@ from .storage import Store, maybe_await
 # User rows that replace the records listed in metadata.replaced_message_ids.
 SUMMARY_NAMES = ("turn_summary", "range_summary")
 
+# Turns that end on a consistent history (every tool call has its result) and
+# may serve as a compression boundary. A step_limit turn is cut off after a
+# full step, so its records are as complete as a completed turn's.
+COMPRESSIBLE_STOP_REASONS = ("completed", "step_limit")
+
+
+def is_compressible_turn_end(message):
+    """A live turn_end mark whose turn may be compressed."""
+    return (message["role"] == "mark" and message.get("name") == "turn_end"
+            and message.get("deleted_at") is None
+            and message["metadata"]["stop_reason"] in COMPRESSIBLE_STOP_REASONS)
+
 
 @dataclass
 class Context:
@@ -95,10 +107,7 @@ class Context:
     @property
     def turns_since_compression(self):
         _, records = self.active_history()
-        return sum(message["role"] == "mark" and message.get("name") == "turn_end"
-                   and message.get("deleted_at") is None
-                   and message["metadata"]["stop_reason"] == "completed"
-                   for message in records)
+        return sum(is_compressible_turn_end(message) for message in records)
 
     @staticmethod
     def summary_message(content):

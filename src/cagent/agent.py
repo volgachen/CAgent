@@ -7,7 +7,7 @@ import logging
 from copy import deepcopy
 from datetime import datetime, timezone
 
-from .context import Context, append_messages
+from .context import COMPRESSIBLE_STOP_REASONS, Context, append_messages, is_compressible_turn_end
 from .images import Image, normalize_images as _normalize_images, split_interleaved as _split_interleaved
 from .storage import Store, maybe_await
 from .tools import execute_tool_call
@@ -468,7 +468,8 @@ class BaseAgent:
 
     @classmethod
     def should_compress(cls, ctx):
-        if ctx.stop_reason != "completed" or ctx.turns_since_compression == 0:
+        if (ctx.stop_reason not in COMPRESSIBLE_STOP_REASONS
+                or ctx.turns_since_compression == 0):
             return False
         return (ctx.force_compression
                 or (ctx.compression_token_threshold is not None and ctx.num_tokens is not None
@@ -580,9 +581,10 @@ class BaseAgent:
         last_turn = next((m for m in reversed(ctx.messages)
                           if m["role"] == "mark" and m.get("name") == "turn_end"
                           and m.get("deleted_at") is None), None)
-        if last_turn is None or last_turn["metadata"]["stop_reason"] != "completed":
+        if (last_turn is None
+                or last_turn["metadata"]["stop_reason"] not in COMPRESSIBLE_STOP_REASONS):
             return ctx
-        ctx.stop("completed")
+        ctx.stop(last_turn["metadata"]["stop_reason"])
         if not cls.should_compress(ctx):
             return ctx
         selected = None
@@ -644,9 +646,7 @@ class BaseAgent:
         _, records = ctx.active_history()
         offset = len(ctx.messages) - len(records)
         end = next((offset + i for i in range(len(records) - 1, -1, -1)
-                    if records[i]["role"] == "mark" and records[i].get("name") == "turn_end"
-                    and records[i].get("deleted_at") is None
-                    and records[i]["metadata"]["stop_reason"] == "completed"), None)
+                    if is_compressible_turn_end(records[i])), None)
         # Segments of the active history: each range_summary row alone, and each
         # turn (its records through its turn_end). A turn a range summary
         # already replaced is covered by that summary's segment and skipped.
@@ -783,9 +783,7 @@ class BaseAgent:
                 return
             # The boundary is a finished turn, so tool pairs are never split.
             through = next(m["id"] for m in reversed(ctx.messages)
-                           if m["role"] == "mark" and m.get("name") == "turn_end"
-                           and m.get("deleted_at") is None
-                           and m["metadata"]["stop_reason"] == "completed")
+                           if is_compressible_turn_end(m))
             boundary = next(i for i, m in enumerate(ctx.messages) if m["id"] == through)
             messages = Context(ctx.session_id, messages=ctx.messages[:boundary + 1],
                                system_prompt=ctx.system_prompt,
