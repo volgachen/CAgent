@@ -63,6 +63,10 @@ class Context:
     turn_start_mark: dict | None = None
     turn_compression_applied: bool = False
     turn_compression_error: str | None = None
+    # The tool call being executed ({"id", "name", "arguments"}), set by the
+    # executor just before a handler runs and cleared after it returns. Lets a
+    # handler find the assistant message that issued it. Never persisted.
+    current_tool_call: dict | None = None
 
     def add_messages(self, messages):
         self.messages.extend(deepcopy(messages))

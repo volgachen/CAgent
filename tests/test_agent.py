@@ -170,6 +170,40 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["tool_call_id"], "b")
         self.assertEqual(second["type"], "extra")
 
+    async def test_handler_sees_its_tool_call_on_ctx(self):
+        seen = []
+
+        async def act(*, store, ctx, agent_cls, size):
+            seen.append(ctx.current_tool_call)
+            return "ok"
+
+        def failing(*, store, ctx, agent_cls):
+            raise ToolError("no")
+
+        tools = {"act": Tool(act), "fail": Tool(failing)}
+        ctx = Context("s")
+        await execute_tool_call(call("a", "act", {"size": "L"}), tools, self.store, ctx, agent_cls=BaseAgent)
+        self.assertEqual(seen, [{"id": "a", "name": "act", "arguments": {"size": "L"}}])
+        self.assertIsNone(ctx.current_tool_call)  # cleared after the handler
+        await execute_tool_call(call("b", "fail"), tools, self.store, ctx, agent_cls=BaseAgent)
+        self.assertIsNone(ctx.current_tool_call)  # cleared on ToolError too
+
+        # A full turn: the issuing assistant message is already stored and has an id.
+        self.store.create_session("s2", "u")
+
+        def find(*, store, ctx, agent_cls):
+            call_id = ctx.current_tool_call["id"]
+            issuer = next(m for m in reversed(ctx.messages) if m["role"] == "assistant"
+                          and any(c["id"] == call_id for c in m.get("tool_calls") or []))
+            seen.append(issuer.get("id"))
+            return "found"
+
+        await BaseAgent.run_turn("go", session_id="s2", store=self.store, tools={"find": Tool(find)},
+                                 model=scripted({"tool_calls": [call("t1", "find")]}, {"content": "done"}))
+        stored = [m for m in self.store.list_messages("s2") if m["role"] == "assistant" and m.get("tool_calls")]
+        self.assertEqual(seen[-1], stored[0]["id"])
+        self.assertIsNotNone(seen[-1])
+
     async def test_typed_tool_error_stays_extra(self):
         async def rejected(*, store, ctx, agent_cls):
             raise ToolError("检索失败")

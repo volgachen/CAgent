@@ -53,12 +53,15 @@ async def execute_tool_call(tool_call, tools, store: Store, ctx, *, agent_cls):
             **arguments, store=store, ctx=ctx, agent_cls=agent_cls)
     except TypeError as exc:
         return message(f"工具执行失败：{tool_call['name']} 参数不匹配（{exc}）")
+    ctx.current_tool_call = deepcopy(tool_call)
     try:
         value = tool.handler(**arguments, store=store, ctx=ctx, agent_cls=agent_cls)
         if inspect.isawaitable(value):
             value = await value
     except ToolError as exc:
         return message(f"工具执行失败：{exc}")
+    finally:
+        ctx.current_tool_call = None
     if isinstance(value, ToolResult):
         metadata = deepcopy(value.metadata)
         json.dumps(metadata, ensure_ascii=False, allow_nan=False)
